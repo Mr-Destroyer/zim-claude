@@ -31,10 +31,15 @@ The installer checks for these and offers to install anything missing:
 | Tool | If missing |
 |---|---|
 | `bash`, `curl`, `base64` | required, installer reports and exits |
-| Claude Code (`claude`) | offers `npm install -g @anthropic-ai/claude-code` |
+| Claude Code (`claude`) | offers `curl -fsSL https://claude.ai/install.sh \| bash` |
 | `litellm` | offers `pip install --user 'litellm[proxy]'` |
 
 Nothing is installed without you answering `y`.
+
+Claude Code uses Anthropic's official installer rather than `npm install -g`: no Node
+dependency, and it sets up the launcher and shell integration itself. It is run
+**without sudo** — it installs under `$HOME` and exits with an explicit error if it
+detects sudo, so running it under sudo would guarantee failure.
 
 **If `python3` has no pip**, the installer cannot install litellm for you. This is the
 default on Arch, where `python` ships without pip, and the old advice here

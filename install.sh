@@ -211,9 +211,12 @@ pip_hint() {
 
 have_pip() { python3 -m pip --version >/dev/null 2>&1; }
 
-ask_install() {   # ask_install <name> <command...>
-  local name="$1"; shift
-  local reply=""
+# ask_yes <name> <display-command> — prompt only; 0 if the user agreed.
+# Split out from ask_install because not every install is a plain argv exec:
+# the Claude Code installer is a shell pipeline, which cannot be passed as
+# arguments to a function.
+ask_yes() {
+  local name="$1" display="$2" reply=""
 
   # No controlling terminal (CI, piped install): never prompt, just report the
   # command. /dev/tty exists as a node even without one, so actually open it.
@@ -221,21 +224,25 @@ ask_install() {   # ask_install <name> <command...>
   # `exec 3</dev/tty 2>/dev/null` would print the error before muting stderr.
   if ! { exec 3</dev/tty; } 2>/dev/null; then
     warn "$name not found. Install with:"
-    warn "  $*"
+    warn "  $display"
     return 1
   fi
 
-  printf '\033[33m[!]\033[0m %s not found. Install now?\n      %s\n      [y/N] ' "$name" "$*" >&2
+  printf '\033[33m[!]\033[0m %s not found. Install now?\n      %s\n      [y/N] ' "$name" "$display" >&2
   read -r reply <&3 || reply=""
   exec 3<&-
   case "$reply" in
-    [yY]|[yY][eE][sS])
-      say "running: $*"
-      if "$@"; then ok "$name installed."; return 0
-      else warn "$name install failed — continuing."; return 1; fi
-      ;;
+    [yY]|[yY][eE][sS]) return 0 ;;
     *) warn "skipped $name."; return 1 ;;
   esac
+}
+
+ask_install() {   # ask_install <name> <command...>
+  local name="$1"; shift
+  ask_yes "$name" "$*" || return 1
+  say "running: $*"
+  if "$@"; then ok "$name installed."; return 0
+  else warn "$name install failed — continuing."; return 1; fi
 }
 
 check_prereqs() {
@@ -248,7 +255,30 @@ check_prereqs() {
     say "found claude: $(command -v claude)"
   else
     warn "claude not found on PATH."
-    ask_install "Claude Code" npm install -g @anthropic-ai/claude-code || PREREQ_FAILED=1
+    # Anthropic's own installer. Preferred over `npm install -g`: no Node
+    # dependency, and it sets up the launcher and shell integration itself.
+    #
+    # Run WITHOUT sudo on purpose. The script installs under $HOME and exits
+    # with an explicit error if it detects sudo, so a sudo here would be a
+    # guaranteed failure rather than a more thorough install.
+    #
+    # It does not put anything on PATH itself — it delegates to `claude
+    # install`, which appends to ~/.bashrc / ~/.zshrc. A non-interactive
+    # shell may not read those, so re-check both PATH and the usual spot.
+    if ask_yes "Claude Code" "curl -fsSL https://claude.ai/install.sh | bash"; then
+      say "running: curl -fsSL https://claude.ai/install.sh | bash"
+      if curl -fsSL https://claude.ai/install.sh | bash; then
+        ok "Claude Code installed."
+      else
+        warn "Claude Code install failed — continuing."
+        PREREQ_FAILED=1
+      fi
+      if ! command -v claude >/dev/null 2>&1 && [[ -x "$BIN_DIR/claude" ]]; then
+        warn "claude landed in $BIN_DIR but is not on PATH in this shell yet."
+      fi
+    else
+      PREREQ_FAILED=1
+    fi
   fi
 
   if command -v litellm >/dev/null 2>&1; then
