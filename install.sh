@@ -186,6 +186,31 @@ EOF
 
 PREREQ_FAILED=0
 
+# Distro detection, for install HINTS only — never for behaviour.
+pkg_manager() {
+  if [[ -n "${TERMUX_VERSION:-}" ]] || [[ "${PREFIX:-}" == *com.termux* ]]; then echo termux
+  elif command -v pacman >/dev/null 2>&1; then echo pacman
+  elif command -v apt-get >/dev/null 2>&1; then echo apt
+  elif command -v dnf >/dev/null 2>&1; then echo dnf
+  else echo unknown
+  fi
+}
+
+# How to get pip, when `python3 -m pip` is missing. Arch ships python without
+# pip, which is why the old advice (`python3 -m pip install ...`) failed with
+# "No module named pip" instead of installing anything.
+pip_hint() {
+  case "$(pkg_manager)" in
+    pacman) echo "sudo pacman -S python-pip" ;;
+    apt)    echo "sudo apt install python3-pip" ;;
+    termux) echo "pkg install python" ;;
+    dnf)    echo "sudo dnf install python3-pip" ;;
+    *)      echo "install pip for python3 using your platform's package manager" ;;
+  esac
+}
+
+have_pip() { python3 -m pip --version >/dev/null 2>&1; }
+
 ask_install() {   # ask_install <name> <command...>
   local name="$1"; shift
   local reply=""
@@ -232,18 +257,40 @@ check_prereqs() {
     say "found litellm: $HOME/.local/bin/litellm (not currently on PATH)"
   else
     warn "litellm not found."
-    ask_install "litellm" \
-      python3 -m pip install --user --break-system-packages 'litellm[proxy]' || PREREQ_FAILED=1
+    if ! have_pip; then
+      # The old advice here was a bare `python3 -m pip install ...`, which on
+      # Arch (python ships without pip) fails with "No module named pip" and
+      # installs nothing. Tell the user how to get pip first, and point at
+      # pipx, which is the right tool for a CLI like litellm anyway.
+      warn "python3 has no pip, so litellm cannot be pip-installed yet."
+      warn "Get pip first:"
+      warn "    $(pip_hint)"
+      warn "Then re-run this installer, or install litellm with pipx:"
+      warn "    pipx install 'litellm[proxy]'"
+      PREREQ_FAILED=1
+    else
+      # --break-system-packages is a Debian/Ubuntu flag; Arch's pip rejects it
+      # outright, so only pass it where it is understood.
+      local pip_args=(install --user 'litellm[proxy]')
+      [[ "$(pkg_manager)" == "apt" ]] && pip_args=(install --user --break-system-packages 'litellm[proxy]')
+      ask_install "litellm" python3 -m pip "${pip_args[@]}" || PREREQ_FAILED=1
+    fi
   fi
 }
 
 # --- PATH --------------------------------------------------------------------
 
 ensure_path() {
+  # This script is a subprocess: it cannot change the PATH of the shell that
+  # launched it. So when BIN_DIR is missing, hand the user the one line that
+  # fixes the CURRENT shell. ('hash -r' is not that line — it only clears the
+  # command-lookup cache and never adds a directory to PATH.)
   case ":$PATH:" in
     *":$BIN_DIR:"*) say "$BIN_DIR is already on PATH" ;;
-    *) warn "$BIN_DIR is not on PATH in this shell — start a new terminal,"
-       warn "or run 'hash -r' if you have already installed before." ;;
+    *) warn "$BIN_DIR is not on PATH in this shell."
+       warn "For THIS shell, run:"
+       warn "    export PATH=\"$BIN_DIR:\$PATH\""
+       warn "A new terminal will pick it up on its own." ;;
   esac
 
   # 1. systemd/uwsm user environment — the idiom already used by

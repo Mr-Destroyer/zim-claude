@@ -32,9 +32,36 @@ The installer checks for these and offers to install anything missing:
 |---|---|
 | `bash`, `curl`, `base64` | required, installer reports and exits |
 | Claude Code (`claude`) | offers `npm install -g @anthropic-ai/claude-code` |
-| `litellm` | offers `pip install --user --break-system-packages 'litellm[proxy]'` |
+| `litellm` | offers `pip install --user 'litellm[proxy]'` |
 
 Nothing is installed without you answering `y`.
+
+**If `python3` has no pip**, the installer cannot install litellm for you. This is the
+default on Arch, where `python` ships without pip, and the old advice here
+(`python3 -m pip install ...`) failed with `No module named pip` and installed nothing.
+The installer now detects the platform and prints the command for yours:
+
+| Platform | Command |
+|---|---|
+| Arch | `sudo pacman -S python-pip` |
+| Debian/Ubuntu | `sudo apt install python3-pip` |
+| Termux | `pkg install python` |
+| Fedora | `sudo dnf install python3-pip` |
+
+`pipx install 'litellm[proxy]'` is the better option for a CLI like litellm — it puts
+it in its own venv and on `PATH`. The Debian-only `--break-system-packages` flag is now
+passed only on Debian/Ubuntu; Arch's pip rejects it.
+
+**`zim-claude: command not found` right after installing.** The installer is a
+subprocess and cannot change the `PATH` of the shell that launched it. A new terminal
+picks up `~/.local/bin` automatically; to fix the shell you are already in:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+(`hash -r` will not help — it clears bash's command-lookup cache and never adds a
+directory to `PATH`.)
 
 ### What it puts where
 
