@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# zim-claude — run Claude Code against the local LiteLLM -> Token Juice route.
+#
+# Every argument is forwarded verbatim to `claude`. This script deliberately
+# parses NO options of its own: `zim-claude --help`, `zim-claude mcp list`,
+# `zim-claude -p "..."` and every other Claude Code flag/subcommand must reach
+# claude unchanged. Configure this script through environment variables only.
+#
+#   LITELLM_ENV_FILE          profile to source   (default ~/claude-source/deepseek-claude)
+#   LITELLM_PORT              proxy port         (default 4000)
+#   LITELLM_LOG               proxy log path     (default /tmp/litellm-proxy.log)
+#   LITELLM_SERVICE           service manager    (default <dir>/start-litellm.sh)
+#   ZIM_CLAUDE_BIN            claude binary      (default: `claude` on PATH)
+#   ZIM_CLAUDE_NO_PROXY=1     never touch the proxy
+#   ZIM_CLAUDE_REQUIRE_PROXY=1  hard-fail if the proxy is not healthy
+
+set -euo pipefail
+
+# Self-locating, so a symlinked or relocated install still finds its sibling
+# start-litellm.sh.
+_self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
+
+LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
+LITELLM_PORT="${LITELLM_PORT:-4000}"
+LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
+LITELLM_SERVICE="${LITELLM_SERVICE:-$_self_dir/start-litellm.sh}"
+
+ZIM_CLAUDE_NO_PROXY="${ZIM_CLAUDE_NO_PROXY:-0}"
+ZIM_CLAUDE_REQUIRE_PROXY="${ZIM_CLAUDE_REQUIRE_PROXY:-0}"
+CLAUDE_BIN="${ZIM_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+
+# All diagnostics go to stderr: `zim-claude -p "x" --output-format json | jq`
+# must stay parseable.
+die()  { printf '\033[31m[zim-claude]\033[0m %s\n' "$*" >&2; exit 2; }
+warn() { printf '\033[33m[zim-claude]\033[0m %s\n' "$*" >&2; }
+info() { printf '\033[36m[zim-claude]\033[0m %s\n' "$*" >&2; }
+
+# --- preconditions -----------------------------------------------------------
+
+[[ -n "$CLAUDE_BIN" ]] \
+  || die "claude not found on PATH. Install Claude Code, or set ZIM_CLAUDE_BIN."
+
+# Check it is actually runnable: exec'ing a missing file would surface as a
+# bare 127 with no explanation.
+[[ -x "$CLAUDE_BIN" ]] \
+  || die "claude is not executable: $CLAUDE_BIN"
+
+# Fail CLOSED. Without the profile, claude would silently use whatever
+# ANTHROPIC_* the user's shell already exports — a session against the wrong
+# provider, with the wrong model, and no indication anything was off.
+[[ -r "$LITELLM_ENV_FILE" ]] \
+  || die "env file not found or unreadable: $LITELLM_ENV_FILE
+       Refusing to run: without it, claude would silently use whatever
+       ANTHROPIC_* variables your shell already exports.
+       Fix:  LITELLM_ENV_FILE=/path/to/profile zim-claude ...
+       or re-run install.sh."
+
+# --- load the profile --------------------------------------------------------
+
+# Captured BEFORE `set -a`, so this bookkeeping var is not itself exported.
+_zim_prev_base_url="${ANTHROPIC_BASE_URL:-}"
+
+set -a
+# shellcheck disable=SC1090
+. "$LITELLM_ENV_FILE"
+set +a
+
+[[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] \
+  || die "$LITELLM_ENV_FILE did not set ANTHROPIC_AUTH_TOKEN — refusing to start."
+
+# Report the override rather than silently changing provider.
+if [[ -n "$_zim_prev_base_url" && "$_zim_prev_base_url" != "${ANTHROPIC_BASE_URL:-}" ]]; then
+  warn "overriding inherited ANTHROPIC_BASE_URL=$_zim_prev_base_url -> ${ANTHROPIC_BASE_URL:-}"
+fi
+
+# --- only manage a proxy when the profile points at the local one ------------
+
+case "${ANTHROPIC_BASE_URL:-}" in
+  *"localhost:${LITELLM_PORT}"*|*"127.0.0.1:${LITELLM_PORT}"*) ;;
+  *)
+    warn "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<unset>} is not the local proxy"
+    warn "on :${LITELLM_PORT}; skipping the proxy start-up check."
+    ZIM_CLAUDE_NO_PROXY=1
+    ;;
+esac
+
+port_answers() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' \
+      "http://127.0.0.1:${LITELLM_PORT}/health/liveliness" --max-time 2 || true)"
+  [[ "$code" == "200" ]]
+}
+
+ensure_proxy() {
+  [[ "$ZIM_CLAUDE_NO_PROXY" == "1" ]] && return 0
+  port_answers && return 0
+
+  if [[ ! -x "$LITELLM_SERVICE" ]]; then
+    warn "proxy not answering on :${LITELLM_PORT}, and no service manager at"
+    warn "$LITELLM_SERVICE. Start it yourself, or set ZIM_CLAUDE_NO_PROXY=1."
+    return 1
+  fi
+
+  info "LiteLLM proxy not answering on :${LITELLM_PORT} — starting it..."
+  # Invoke as a SUBPROCESS, never `source`: start-litellm.sh's trailing `case`
+  # runs on load, and its functions call `exit`.
+  if "$LITELLM_SERVICE" start; then
+    info "proxy is up."
+    return 0
+  fi
+  warn "could not start the proxy — see $LITELLM_LOG"
+  warn "continuing anyway; claude will report the connection error."
+  return 1
+}
+
+# Serialize cold starts. do_start() has a check-then-act window, so two racing
+# invocations would both spawn litellm; the second fails to bind :4000 but the
+# health poll still succeeds (the first bound it), leaving an orphan.
+if command -v flock >/dev/null 2>&1 && [[ "$ZIM_CLAUDE_NO_PROXY" != "1" ]]; then
+  exec 9>"${TMPDIR:-/tmp}/zim-claude-proxy.lock"
+  flock 9
+  ensure_proxy || true
+  flock -u 9
+  # bash sets no close-on-exec on fds opened with `exec N>`; don't leak fd 9.
+  exec 9>&-
+else
+  ensure_proxy || true
+fi
+
+if [[ "$ZIM_CLAUDE_REQUIRE_PROXY" == "1" ]] && ! port_answers; then
+  die "proxy is not healthy on :${LITELLM_PORT} and ZIM_CLAUDE_REQUIRE_PROXY=1."
+fi
+
+# --- hand off ----------------------------------------------------------------
+
+# exec: no extra bash layer, so exit status, signal delivery and TTY ownership
+# all belong to claude. NOTE: exec discards EXIT traps — do not add one here.
+exec "$CLAUDE_BIN" "$@"

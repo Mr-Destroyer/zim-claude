@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Recording stub that stands in for the real `claude` binary in tests.
+# Prints argc, every argv element, and the ANTHROPIC_* environment it received,
+# so the wrapper's argument pass-through and env exports can both be asserted.
+
+printf 'ARGC=%d\n' "$#"
+i=0
+for a in "$@"; do
+  i=$((i + 1))
+  printf '  [%d]=<%s>\n' "$i" "$a"
+done
+printf 'BASE_URL=%s\n' "${ANTHROPIC_BASE_URL:-}"
+printf 'MODEL=%s\n' "${ANTHROPIC_MODEL:-}"
+printf 'TOKEN_SET=%s\n' "${ANTHROPIC_AUTH_TOKEN:+yes}"
+printf 'APIKEY=<%s>\n' "${ANTHROPIC_API_KEY:-}"
+printf 'UNRELATED=%s\n' "${ZIM_TEST_UNRELATED:-}"
+
+# Set by a test to prove no stray fd leaked in from the wrapper's flock.
+if [[ -n "${ZIM_TEST_CHECK_FDS:-}" ]]; then
+  if ls -l /proc/self/fd 2>/dev/null | grep -q 'zim-claude-proxy.lock'; then
+    printf 'FD_LEAK=yes\n'
+  else
+    printf 'FD_LEAK=no\n'
+  fi
+fi

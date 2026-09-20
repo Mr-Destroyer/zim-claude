@@ -1,0 +1,6 @@
+model_list:
+  - model_name: deepseek-v4.1-flash
+    litellm_params:
+      model: openai/deepseek-ai/DeepSeek-V4.1-Flash
+      api_base: https://api.tokenjuice.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
