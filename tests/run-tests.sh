@@ -68,16 +68,22 @@ if hits="$(grep -rn '/home/zim' "$REPO" --exclude-dir=.git --exclude-dir=tests 2
   fail "no hardcoded /home/zim" "$hits"
 else pass "no hardcoded /home/zim"; fi
 
-# The whole point of config/.token.b64: the token must not be greppable.
-if hits="$(grep -rnE 'tj_[A-Za-z0-9]{10,}' "$REPO" --exclude-dir=.git 2>/dev/null)"; then
-  fail "no plaintext token in repo" "$hits"
-else pass "no plaintext token in repo"; fi
+# The token ships in plaintext (config/token) by design — it has to survive a
+# fresh clone, and a base64 blob that GitHub's web uploader silently skips does
+# not. What matters is that the file is present, non-empty, and tracked.
+if [[ -f "$REPO/config/token" ]]; then
+  if [[ -n "$(tr -d ' \t\r\n' < "$REPO/config/token")" ]]; then
+    pass "config/token holds a non-empty token"
+  else fail "config/token is empty"; fi
+else fail "config/token missing"; fi
 
-if [[ -f "$REPO/config/.token.b64" ]]; then
-  if [[ -n "$(base64 -d < "$REPO/config/.token.b64" 2>/dev/null)" ]]; then
-    pass "config/.token.b64 decodes to a non-empty token"
-  else fail "config/.token.b64 does not decode"; fi
-else fail "config/.token.b64 missing"; fi
+# A clone that lacks the token installs a broken wrapper. This is the exact
+# failure that shipped: the file existed locally but was never committed.
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  if git -C "$REPO" ls-files --error-unmatch config/token >/dev/null 2>&1; then
+    pass "config/token is tracked by git"
+  else fail "config/token is NOT tracked — a fresh clone will not have it"; fi
+else skip "not a git checkout — cannot verify tracking"; fi
 
 # ---------------------------------------------------------------- sandbox ---
 
@@ -114,7 +120,7 @@ assert_contains "bashrc marker block added" "# >>> zim-claude >>>" \
   "$(cat "$SBX/.bashrc" 2>/dev/null)"
 
 # The installed env file must decode to the same token as the repo blob.
-want="$(base64 -d < "$REPO/config/.token.b64")"
+want="$(tr -d ' \t\r\n' < "$REPO/config/token")"
 got="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$SBX/claude-source/deepseek-claude")"
 assert_eq "installed token matches repo blob" "$want" "$got"
 

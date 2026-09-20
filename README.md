@@ -142,16 +142,18 @@ installer places things. If you edit them, keep them identical to the working or
 `help` reads its own header with `sed -n '2,9p'`, so its comment block must stay on
 lines 2–9.
 
-**The token is base64-encoded, which is obfuscation, not encryption.** `install.sh` has
-to reverse it to write the profile, so anyone with the repo can too:
+**The token ships in plaintext at `config/token`.** This is deliberate. An earlier
+revision kept it base64-encoded in `config/.token.b64`, which failed in practice for a
+reason that had nothing to do with base64: GitHub's web uploader skips dotfiles, so the
+file was never committed, and every fresh clone installed a wrapper with no credential.
+Base64 was never protection anyway — `install.sh` had to reverse it, so anyone with the
+repo could too.
 
-```bash
-base64 -d config/.token.b64
-```
+Treat the repo as containing the credential. If it is ever pushed somewhere public,
+rotate the token at Token Juice rather than trying to scrub the history.
 
-It exists to keep the key out of casual `grep` and `git log -p` and out of sight in an
-editor — not to protect it from someone who wants it. Treat the repo as containing the
-credential.
+`install.sh` still reads `config/.token.b64` if `config/token` is absent, so an older
+checkout keeps working.
 
 **Tests:**
 

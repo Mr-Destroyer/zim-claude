@@ -139,12 +139,31 @@ install_config_env() {
     return 0
   fi
 
-  local token
-  token="$(base64 -d < "$SRC_DIR/config/.token.b64" 2>/dev/null || true)"
+  # Plaintext token file. Trims surrounding whitespace, including the CR that
+  # a Windows checkout or a copy-paste through a browser adds — a trailing CR
+  # would otherwise end up inside the export and break authentication with a
+  # 401 that looks like a bad key.
+  local token="" src=""
+  if [[ -f "$SRC_DIR/config/token" ]]; then
+    src="$SRC_DIR/config/token"
+    token="$(tr -d ' \t\r\n' < "$src" || true)"
+  elif [[ -f "$SRC_DIR/config/.token.b64" ]]; then
+    # Legacy layout: base64 blob. Kept so an existing checkout still installs.
+    src="$SRC_DIR/config/.token.b64"
+    token="$(base64 -d < "$src" 2>/dev/null | tr -d ' \t\r\n' || true)"
+  fi
+
   if [[ -z "$token" ]]; then
-    err "could not decode $SRC_DIR/config/.token.b64"
+    err "no token found in $SRC_DIR/config/"
+    err "  expected $SRC_DIR/config/token to hold the ANTHROPIC_AUTH_TOKEN"
     return 1
   fi
+
+  case "$token" in
+    *[!A-Za-z0-9_.:-]*)
+      err "token in $src contains unexpected characters — refusing to install it"
+      return 1 ;;
+  esac
 
   say "writing env file: $ENV_FILE"
   if (( DRY_RUN )); then
