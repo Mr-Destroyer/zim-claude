@@ -7,7 +7,7 @@
 # claude unchanged. Configure this script through environment variables only.
 #
 #   LITELLM_ENV_FILE          profile to source   (default ~/claude-source/deepseek-claude)
-#   LITELLM_PORT              proxy port         (default 4000)
+#   LITELLM_PORT              proxy port         (default: the port in the profile)
 #   LITELLM_LOG               proxy log path     (default /tmp/litellm-proxy.log)
 #   LITELLM_SERVICE           service manager    (default <dir>/start-litellm.sh)
 #   ZIM_CLAUDE_BIN            claude binary      (default: `claude` on PATH)
@@ -22,6 +22,11 @@ set -euo pipefail
 _self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
 
 LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
+# Kept separate so "not set" can mean "follow the profile". The installer picks
+# a port by probing and records it in ANTHROPIC_BASE_URL; hardcoding 4000 here
+# would make the wrapper check, and try to start, a proxy the profile does not
+# use — and on a machine where another proxy owns :4000, warn on every run.
+_zim_port_explicit="${LITELLM_PORT:+1}"
 LITELLM_PORT="${LITELLM_PORT:-4000}"
 LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
 LITELLM_SERVICE="${LITELLM_SERVICE:-$_self_dir/start-litellm.sh}"
@@ -74,6 +79,18 @@ if [[ -n "$_zim_prev_base_url" && "$_zim_prev_base_url" != "${ANTHROPIC_BASE_URL
   warn "overriding inherited ANTHROPIC_BASE_URL=$_zim_prev_base_url -> ${ANTHROPIC_BASE_URL:-}"
 fi
 
+# --- follow the profile's port -----------------------------------------------
+
+# The profile is the single source of truth for where the proxy lives. Only an
+# explicit LITELLM_PORT overrides it.
+if [[ -z "$_zim_port_explicit" && -n "${ANTHROPIC_BASE_URL:-}" ]]; then
+  _zim_url_port="${ANTHROPIC_BASE_URL##*:}"
+  _zim_url_port="${_zim_url_port%%/*}"
+  if [[ "$_zim_url_port" =~ ^[0-9]+$ ]]; then
+    LITELLM_PORT="$_zim_url_port"
+  fi
+fi
+
 # --- only manage a proxy when the profile points at the local one ------------
 
 case "${ANTHROPIC_BASE_URL:-}" in
@@ -104,8 +121,9 @@ ensure_proxy() {
 
   info "LiteLLM proxy not answering on :${LITELLM_PORT} — starting it..."
   # Invoke as a SUBPROCESS, never `source`: start-litellm.sh's trailing `case`
-  # runs on load, and its functions call `exit`.
-  if "$LITELLM_SERVICE" start; then
+  # runs on load, and its functions call `exit`. LITELLM_PORT is passed
+  # explicitly because the profile, not this script's default, chose the port.
+  if LITELLM_PORT="$LITELLM_PORT" "$LITELLM_SERVICE" start; then
     info "proxy is up."
     return 0
   fi
@@ -115,8 +133,8 @@ ensure_proxy() {
 }
 
 # Serialize cold starts. do_start() has a check-then-act window, so two racing
-# invocations would both spawn litellm; the second fails to bind :4000 but the
-# health poll still succeeds (the first bound it), leaving an orphan.
+# invocations would both spawn litellm; the second fails to bind the port but
+# the health poll still succeeds (the first bound it), leaving an orphan.
 if command -v flock >/dev/null 2>&1 && [[ "$ZIM_CLAUDE_NO_PROXY" != "1" ]]; then
   exec 9>"${TMPDIR:-/tmp}/zim-claude-proxy.lock"
   flock 9

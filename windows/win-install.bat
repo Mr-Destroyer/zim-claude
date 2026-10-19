@@ -10,10 +10,11 @@ rem All flags pass straight through to win-install.ps1:
 rem
 rem   win-install.bat -DryRun       print every action, change nothing
 rem   win-install.bat               install both sides and start the proxies
-rem   win-install.bat -SkipDesktop  CLI proxy (:4000) only
+rem   win-install.bat -SkipDesktop  CLI proxy only
 rem   win-install.bat -SkipCli      Claude Desktop gateway (:4002) only
 rem   win-install.bat -NoStart      install but do not start the proxies
 rem   win-install.bat -Force        overwrite hand-edited files (backed up first)
+rem   win-install.bat -Port N       use port N instead of auto-detecting one
 rem   win-install.bat -Uninstall    remove what the installer created
 rem   win-install.bat -Help
 rem

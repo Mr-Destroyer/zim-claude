@@ -8,6 +8,7 @@
 #   ./install.sh --no-rc        don't touch ~/.bashrc
 #   ./install.sh --start        start the LiteLLM proxy when done
 #   ./install.sh --no-venv      never build the proxy virtualenv
+#   ./install.sh --port N       use port N instead of auto-detecting one
 #   ./install.sh --help
 #
 # Everything is derived from $HOME, so this works for any user on any machine.
@@ -46,10 +47,26 @@ ENVD_CONF="$ENVD_DIR/zim-claude.conf"
 MARKER_BEGIN="# >>> zim-claude >>>"
 MARKER_END="# <<< zim-claude <<<"
 
+# Ports probed when choosing where the CLI proxy should live. 4002 is
+# deliberately absent: that is the Claude Desktop gateway, and pointing the CLI
+# at it would replace the desktop app's route. Overridable so a test (or a
+# machine with an unusual range) can use different ports.
+PORT_CANDIDATES="${ZIM_CLAUDE_PORT_CANDIDATES:-4000 4001 4003 4004 4005 4006 4007 4008 4009 4010}"
+
+# The model name written into profiles. Must exist in config/litellm-config.yaml
+# and in the live catalog: a name Logfare has retired fails as a 404 that looks
+# like a broken proxy.
+PROFILE_MODEL="deepseek-v4.1-flash"
+
+# Filled in by install_config_env; migrate_shell_rc writes the same port.
+PROXY_PORT_CHOSEN=""
+PROFILE_TOKEN_EFFECTIVE=""
+
 # --- flags -------------------------------------------------------------------
 DRY_RUN=0 UNINSTALL=0 FORCE=0 TOUCH_RC=1 DO_START=0 DO_VENV=1
+PROXY_PORT=""
 
-usage() { sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while (($#)); do
   case "$1" in
@@ -59,11 +76,20 @@ while (($#)); do
     --no-rc)     TOUCH_RC=0 ;;
     --start)     DO_START=1 ;;
     --no-venv)   DO_VENV=0 ;;
+    --port)
+      [[ $# -ge 2 ]] || { printf -- '--port needs a value\n\n' >&2; usage >&2; exit 2; }
+      PROXY_PORT="$2"; shift ;;
+    --port=*)    PROXY_PORT="${1#--port=}" ;;
     -h|--help)   usage; exit 0 ;;
     *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ -n "$PROXY_PORT" && ! "$PROXY_PORT" =~ ^[0-9]+$ ]]; then
+  printf 'invalid --port: %s (expected a number)\n' "$PROXY_PORT" >&2
+  exit 2
+fi
 
 # --- output ------------------------------------------------------------------
 say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -143,14 +169,113 @@ install_file() {   # install_file <src> <dest> <mode>
   record_state "$dest" "$mode"
 }
 
+# --- choosing a proxy port ---------------------------------------------------
+#
+# The profile points claude at a local proxy, and the proxy is only useful if it
+# accepts the profile's token. Two things make a hardcoded :4000 wrong:
+#
+#   - another LiteLLM (ZimZilla's, a leftover install) already holds :4000 and
+#     rejects the token, answering every request with "No connected db."
+#   - that other proxy is fine, but it is on a different port.
+#
+# So the installer probes: it keeps a port that already accepts the token, keeps
+# a free port (zim-claude will start its own proxy there), and otherwise moves
+# to the first candidate that works. --port overrides the whole search.
+
+# port_open <port> — something is listening. curl reports 000 when it cannot
+# connect, so no HTTP status at all means "free".
+port_open() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 \
+      "http://127.0.0.1:$1/health/liveliness" 2>/dev/null || true)"
+  [[ -n "$code" && "$code" != "000" ]]
+}
+
+# proxy_accepts_token <port> <token> — a LiteLLM proxy on this port was started
+# with a master key matching the token. /v1/models is the cheapest endpoint that
+# authenticates: a mismatched master key answers 400 ("No connected db."), an
+# unauthenticated service answers 401.
+proxy_accepts_token() {
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+      -H "Authorization: Bearer $2" \
+      "http://127.0.0.1:$1/v1/models" 2>/dev/null || true)"
+  [[ "$code" == "200" ]]
+}
+
+# port_from_url <url> — the port a base URL points at, 4000 if it names none.
+port_from_url() {
+  local url="$1" port
+  port="${url##*:}"
+  port="${port%%/*}"
+  if [[ "$port" =~ ^[0-9]+$ ]]; then printf '%s' "$port"; else printf '4000'; fi
+}
+
+# choose_proxy_port <token> [<current-url>] — sets PROXY_PORT_CHOSEN.
+choose_proxy_port() {
+  local token="$1" current_url="${2:-}" current_port="" p
+
+  if [[ -n "$PROXY_PORT" ]]; then
+    PROXY_PORT_CHOSEN="$PROXY_PORT"
+    say "proxy port: $PROXY_PORT_CHOSEN (--port)"
+    return 0
+  fi
+
+  # 1. The port already recorded in the profile, if it is usable as-is.
+  if [[ -n "$current_url" ]]; then
+    current_port="$(port_from_url "$current_url")"
+    if proxy_accepts_token "$current_port" "$token"; then
+      PROXY_PORT_CHOSEN="$current_port"
+      say "proxy port: $current_port (already accepting the profile's token)"
+      return 0
+    fi
+    if ! port_open "$current_port"; then
+      PROXY_PORT_CHOSEN="$current_port"
+      say "proxy port: $current_port (free — zim-claude will start the proxy there)"
+      return 0
+    fi
+    warn "port :$current_port is taken by something that rejects the profile's token"
+  fi
+
+  # 2. A proxy that already accepts the token, wherever it is.
+  for p in $PORT_CANDIDATES; do
+    if proxy_accepts_token "$p" "$token"; then
+      PROXY_PORT_CHOSEN="$p"
+      say "proxy port: $p (a running proxy already accepts the token)"
+      return 0
+    fi
+  done
+
+  # 3. A free port, so we can start our own proxy.
+  for p in $PORT_CANDIDATES; do
+    if ! port_open "$p"; then
+      PROXY_PORT_CHOSEN="$p"
+      say "proxy port: $p (free)"
+      return 0
+    fi
+  done
+
+  PROXY_PORT_CHOSEN="${PORT_CANDIDATES%% *}"
+  warn "every candidate port is busy and none accepts the token."
+  warn "  falling back to :$PROXY_PORT_CHOSEN — pass --port N to choose another."
+}
+
+# --- the env profile ---------------------------------------------------------
+
 # The env file is special: it holds a live credential, so it is never
 # overwritten — not even with --force. Losing it would mean re-issuing a token.
 #
-# The one exception is a legacy Token Juice profile. Token Juice keys start
-# with `tj_` and are useless against Logfare (the proxy forwards them upstream
-# and every request 401s), so an install carried over from the old upstream
-# would look fine and fail on first use. That case is migrated, with a backup;
-# any other credential is the user's own and is left alone.
+# Two exceptions are repaired, each with a backup:
+#
+#   - a legacy Token Juice profile (tj_ key). Token Juice keys are useless
+#     against Logfare (the proxy forwards them upstream and every request
+#     401s), so the install would look fine and fail on first use.
+#   - a Logfare profile whose base URL points at a port that rejects its own
+#     token. That is a real machine: another proxy holds :4000 and answers
+#     "No connected db." The token is fine, the port is not, so only the port
+#     is moved.
+#
+# Any other credential is the user's own and is left alone.
 install_config_env() {
   run mkdir -p -- "$HOME_SRC_DIR"
   run chmod 700 -- "$HOME_SRC_DIR"
@@ -169,31 +294,60 @@ install_config_env() {
     token="$(base64 -d < "$src" 2>/dev/null | tr -d ' \t\r\n' || true)"
   fi
 
-  if [[ -e "$ENV_FILE" ]]; then
-    local current=""
-    current="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
+  PROFILE_TOKEN_EFFECTIVE="$token"
 
-    if [[ "$current" != tj_* ]]; then
+  if [[ -e "$ENV_FILE" ]]; then
+    local current="" current_url=""
+    current="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
+    current_url="$(sed -n 's/^export ANTHROPIC_BASE_URL="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
+
+    if [[ "$current" == tj_* ]]; then
+      # A Token Juice credential. Replace it with the shipped Logfare token.
+      if [[ -z "$token" ]]; then
+        err "existing env file has a Token Juice token, but $SRC_DIR/config/token is missing"
+        err "  cannot migrate it to Logfare — re-clone or restore config/token"
+        return 1
+      fi
+      backup_if_exists "$ENV_FILE"
+      say "migrating env file from Token Juice to Logfare: $ENV_FILE"
+      choose_proxy_port "$token" "$current_url"
+      if (( DRY_RUN )); then
+        printf '    would rewrite 4 ANTHROPIC_* exports (token redacted)\n'
+        return 0
+      fi
+      # Fall through to the writer below; it overwrites the file wholesale, so
+      # nothing from the Token Juice profile (including ANTHROPIC_MODEL) survives.
+      : >"$ENV_FILE"
+
+    elif [[ "$current" == lfu_* ]]; then
+      # A Logfare profile. Keep the credential; make sure its port works.
+      PROFILE_TOKEN_EFFECTIVE="$current"
+      choose_proxy_port "$current" "$current_url"
+      if [[ -z "$current_url" ]] || \
+         [[ "$PROXY_PORT_CHOSEN" == "$(port_from_url "$current_url")" ]]; then
+        say "keeping existing env file: $ENV_FILE (never overwritten)"
+        run chmod 600 -- "$ENV_FILE"
+        return 0
+      fi
+      backup_if_exists "$ENV_FILE"
+      say "moving the env profile to port :$PROXY_PORT_CHOSEN (it rejected its token on :$(port_from_url "$current_url"))"
+      if (( DRY_RUN )); then
+        printf '    would rewrite ANTHROPIC_BASE_URL to http://localhost:%s\n' "$PROXY_PORT_CHOSEN"
+        return 0
+      fi
+      : >"$ENV_FILE"
+      token="$current"
+
+    else
+      # Someone else's credential. Leave it exactly as it is.
       say "keeping existing env file: $ENV_FILE (never overwritten)"
       run chmod 600 -- "$ENV_FILE"
+      PROFILE_TOKEN_EFFECTIVE="$current"
+      choose_proxy_port "${current:-$token}" "$current_url"
       return 0
     fi
-
-    # A Token Juice credential. Replace it with the shipped Logfare token.
-    if [[ -z "$token" ]]; then
-      err "existing env file has a Token Juice token, but $SRC_DIR/config/token is missing"
-      err "  cannot migrate it to Logfare — re-clone or restore config/token"
-      return 1
-    fi
-    backup_if_exists "$ENV_FILE"
-    say "migrating env file from Token Juice to Logfare: $ENV_FILE"
-    if (( DRY_RUN )); then
-      printf '    would rewrite 4 ANTHROPIC_* exports (token redacted)\n'
-      return 0
-    fi
-    # Fall through to the writer below; it overwrites the file wholesale, so
-    # nothing from the Token Juice profile (including ANTHROPIC_MODEL) survives.
-    : >"$ENV_FILE"
+  else
+    choose_proxy_port "$token"
   fi
 
   if [[ -z "$token" ]]; then
@@ -216,13 +370,72 @@ install_config_env() {
 
   install -D -m 600 /dev/null "$ENV_FILE"
   cat >"$ENV_FILE" <<EOF
-export ANTHROPIC_BASE_URL="http://localhost:4000"
+export ANTHROPIC_BASE_URL="http://localhost:$PROXY_PORT_CHOSEN"
 export ANTHROPIC_AUTH_TOKEN="$token"
-export ANTHROPIC_MODEL="deepseek-v4.1-flash"
+export ANTHROPIC_MODEL="$PROFILE_MODEL"
 export ANTHROPIC_API_KEY=""
 EOF
   chmod 600 -- "$ENV_FILE"
-  ok "wrote $ENV_FILE (mode 600)"
+  ok "wrote $ENV_FILE (mode 600, port $PROXY_PORT_CHOSEN)"
+}
+
+# --- the user's shell rc -----------------------------------------------------
+#
+# ~/.bashrc commonly carries the same four ANTHROPIC_* exports, added by hand
+# or by an older install. After a Token Juice -> Logfare move they point at a
+# dead provider: a tj_ key, a model Logfare no longer serves, and the old port.
+# Plain `claude` would use them and fail.
+#
+# Only a tj_ token triggers a rewrite. Any other credential is the user's own;
+# it is reported by check_conflicts, never changed.
+migrate_shell_rc() {
+  local rc="$HOME/.bashrc"
+  [[ -f "$rc" ]] || return 0
+
+  local rc_token=""
+  rc_token="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$rc" 2>/dev/null | head -1)"
+  [[ "$rc_token" == tj_* ]] || return 0
+
+  # --no-rc means "do not touch my shell config", and that includes this.
+  if (( ! TOUCH_RC )); then
+    warn "$rc still exports a Token Juice token (tj_...) — left alone (--no-rc)."
+    return 0
+  fi
+
+  if [[ -z "$PROFILE_TOKEN_EFFECTIVE" ]]; then
+    warn "$rc exports a Token Juice token, but no Logfare token is available to replace it."
+    return 0
+  fi
+
+  backup_if_exists "$rc"
+  say "migrating $rc from Token Juice to Logfare"
+  if (( DRY_RUN )); then
+    printf '    would rewrite the ANTHROPIC_* exports (token redacted)\n'
+    return 0
+  fi
+
+  # Rewrite only the four names this project owns, and only where they already
+  # exist. Anything else in the file is untouched, and the line order is kept so
+  # the user's own comments stay attached to the right line.
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/zim-rc.XXXXXX")"
+  if ! awk -v base="export ANTHROPIC_BASE_URL=\"http://localhost:$PROXY_PORT_CHOSEN\"" \
+           -v tok="export ANTHROPIC_AUTH_TOKEN=\"$PROFILE_TOKEN_EFFECTIVE\"" \
+           -v model="export ANTHROPIC_MODEL=\"$PROFILE_MODEL\"" \
+           -v apikey='export ANTHROPIC_API_KEY=""' '
+    /^[[:space:]]*export[[:space:]]+ANTHROPIC_BASE_URL=/  { print base;  next }
+    /^[[:space:]]*export[[:space:]]+ANTHROPIC_AUTH_TOKEN=/ { print tok;   next }
+    /^[[:space:]]*export[[:space:]]+ANTHROPIC_MODEL=/      { print model; next }
+    /^[[:space:]]*export[[:space:]]+ANTHROPIC_API_KEY=/    { print apikey; next }
+    { print }
+  ' "$rc" >"$tmp"; then
+    rm -f -- "$tmp"
+    warn "could not rewrite $rc — leaving it as it was"
+    return 0
+  fi
+  cat -- "$tmp" >"$rc"
+  rm -f -- "$tmp"
+  ok "updated $rc (port $PROXY_PORT_CHOSEN, model $PROFILE_MODEL)"
 }
 
 # --- auto-update -------------------------------------------------------------
@@ -535,10 +748,17 @@ ensure_path() {
 
 check_conflicts() {
   local rc="$HOME/.bashrc"
-  if [[ -f "$rc" ]] && grep -q 'ANTHROPIC_' "$rc"; then
+  # After a migration the file holds OUR values, and warning about them would
+  # be noise about a conflict that no longer exists. Only report a credential
+  # the installer did not put there.
+  if [[ -f "$rc" ]] && grep -q 'ANTHROPIC_' "$rc" && \
+     ! grep -qF "ANTHROPIC_AUTH_TOKEN=\"$PROFILE_TOKEN_EFFECTIVE\"" "$rc"; then
     warn "$rc exports ANTHROPIC_* — plain 'claude' uses that provider."
     warn "'zim-claude' overrides it. Affected lines:"
-    grep -n 'ANTHROPIC_' "$rc" | sed 's/^/      /' >&2
+    # Redact the credential: this output is routinely pasted into a bug report.
+    grep -n 'ANTHROPIC_' "$rc" \
+      | sed 's/^\([0-9]*:\)export ANTHROPIC_AUTH_TOKEN=.*/\1export ANTHROPIC_AUTH_TOKEN=<redacted>/' \
+      | sed 's/^/      /' >&2
   fi
 
   # Claude Code applies a settings.json "env" block AFTER inheriting the
@@ -660,6 +880,7 @@ install_config_env
 write_update_conf
 
 ensure_path
+migrate_shell_rc
 check_conflicts
 
 printf '\n'
@@ -670,8 +891,9 @@ ok "done. Try:  zim-claude --version"
 
 if (( DO_START )) && [[ -x "$BIN_DIR/start-litellm.sh" ]]; then
   printf '\n'
-  say "starting the LiteLLM proxy"
-  "$BIN_DIR/start-litellm.sh" start || warn "proxy did not start — see /tmp/litellm-proxy.log"
+  say "starting the LiteLLM proxy on :$PROXY_PORT_CHOSEN"
+  LITELLM_PORT="$PROXY_PORT_CHOSEN" "$BIN_DIR/start-litellm.sh" start \
+    || warn "proxy did not start — see /tmp/litellm-proxy.log"
 fi
 
 (( PREREQ_FAILED )) && exit 1

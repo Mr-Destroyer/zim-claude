@@ -61,8 +61,19 @@ else { $GatewayKey = 'sk-claude-desktop-local' }
 
 # Per-proxy definition. Config paths match where the installer puts them, so a
 # file the user hand-edits in place is the one actually served.
+#
+# The CLI port follows the profile: the installer probes for a port whose proxy
+# accepts the profile's token and records it in ANTHROPIC_BASE_URL. Defaulting
+# to 4000 here would start a proxy the profile does not use - and on a machine
+# where another LiteLLM owns :4000, would fail to bind at all.
 $CliPort = 4000
-if ($env:LITELLM_PORT) { $CliPort = [int]$env:LITELLM_PORT }
+if ($env:LITELLM_PORT) {
+  $CliPort = [int]$env:LITELLM_PORT
+} elseif (Test-Path -LiteralPath $EnvFile) {
+  foreach ($line in Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue) {
+    if ($line -match '^export\s+ANTHROPIC_BASE_URL=".*:([0-9]+)"') { $CliPort = [int]$Matches[1]; break }
+  }
+}
 $DeskPort = 4002
 if ($env:CLAUDE_DESKTOP_PORT) { $DeskPort = [int]$env:CLAUDE_DESKTOP_PORT }
 

@@ -316,9 +316,43 @@ fi
 SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-XXXXXX")"
 trap 'rm -rf "$SBX"' EXIT
 
+# The installer probes localhost for a usable proxy port. Probing the REAL
+# ports would make every assertion depend on whatever proxies this machine
+# happens to be running, so the sandbox gets a stub curl that answers from
+# ZIM_TEST_BUSY / ZIM_TEST_ACCEPT instead of the network.
+#
+#   busy   : health 200, /v1/models 400  (a proxy with a different master key)
+#   accept : health 200, /v1/models 200  (a proxy that takes our token)
+#   other  : 000                         (nothing listening)
+STUB_BIN="$SBX/stubbin"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/curl" <<'EOF'
+#!/usr/bin/env bash
+port=""
+health=0
+for a in "$@"; do
+  case "$a" in
+    http://127.0.0.1:*) port="${a#http://127.0.0.1:}"; port="${port%%/*}" ;;
+    */health/liveliness) health=1 ;;
+  esac
+done
+status=000
+case " ${ZIM_TEST_BUSY:-} " in *" $port "*) status=400 ;; esac
+case " ${ZIM_TEST_ACCEPT:-} " in *" $port "*) status=200 ;; esac
+if (( health )) && [[ -n "$port" ]]; then
+  case " ${ZIM_TEST_BUSY:-} ${ZIM_TEST_ACCEPT:-} " in *" $port "*) status=200 ;; esac
+fi
+printf '%s' "$status"
+EOF
+chmod +x "$STUB_BIN/curl"
+
 # Run the installer with a HOME that has no ~/.local/bin on PATH, which also
 # exercises the PATH-not-set branch.
-sbx_install() { env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb bash "$REPO/install.sh" "$@" </dev/null; }
+sbx_install() {
+  env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+    ZIM_TEST_BUSY="${ZIM_TEST_BUSY:-}" ZIM_TEST_ACCEPT="${ZIM_TEST_ACCEPT:-}" \
+    bash "$REPO/install.sh" "$@" </dev/null
+}
 
 section "install into sandbox \$HOME"
 
@@ -416,6 +450,89 @@ if compgen -G "$SBX/.local/share/zim-claude/backups/*/claude-source__deepseek-cl
 else fail "migration backs up the old profile" "no backup of the tj_ profile found"; fi
 assert_eq "migrated profile is mode 600" "600" \
   "$(stat -c%a "$SBX/claude-source/deepseek-claude" 2>/dev/null)"
+
+section "proxy port selection"
+
+# :4000 held by a proxy that rejects the token is the failure this machine
+# actually has: the profile says :4000, the proxy there answers every request
+# with "No connected db.", and zim-claude looks broken while the real problem
+# is the port. The installer must move the profile to a port that works.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_MODEL="deepseek-v4.1-flash"\n' >> "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_API_KEY=""\n' >> "$SBX/claude-source/deepseek-claude"
+out="$(ZIM_TEST_BUSY="4000 4001 4002 4003" ZIM_TEST_ACCEPT="4005" sbx_install 2>&1)"
+assert_contains "a proxy that rejects the token is reported" \
+  "rejects the profile's token" "$out"
+assert_contains "the profile follows a proxy that accepts it" \
+  'ANTHROPIC_BASE_URL="http://localhost:4005"' "$(cat "$SBX/claude-source/deepseek-claude")"
+assert_contains "the port move is explained" "moving the env profile to port :4005" "$out"
+assert_contains "the credential is kept, not replaced" \
+  "lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden" "$(cat "$SBX/claude-source/deepseek-claude")"
+if compgen -G "$SBX/.local/share/zim-claude/backups/*/claude-source__deepseek-claude" >/dev/null; then
+  pass "the port move backs up the profile"
+else fail "the port move backs up the profile" "no backup found"; fi
+
+# A free :4000 is fine: zim-claude starts its own proxy there.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/claude-source/deepseek-claude"
+out="$(sbx_install 2>&1)"
+assert_contains "a free port is kept" "free — zim-claude will start the proxy there" "$out"
+assert_contains "a free port leaves the profile alone" \
+  'ANTHROPIC_BASE_URL="http://localhost:4000"' "$(cat "$SBX/claude-source/deepseek-claude")"
+
+# --port overrides the search entirely, even when another port looks usable.
+out="$(ZIM_TEST_ACCEPT="4000" sbx_install --port 4100 2>&1)"
+assert_contains "--port is honoured" "proxy port: 4100 (--port)" "$out"
+
+# A port already accepting the token is not moved.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/claude-source/deepseek-claude"
+out="$(ZIM_TEST_ACCEPT="4000" sbx_install 2>&1)"
+assert_contains "a working port is reported as working" \
+  "already accepting the profile's token" "$out"
+
+section "shell rc migration"
+
+# ~/.bashrc commonly holds the same four exports. A tj_ token there is a dead
+# provider for plain `claude`, so it is rewritten - with a backup.
+cat > "$SBX/.bashrc" <<'EOF'
+# user's own file
+export EDITOR=vim
+export ANTHROPIC_BASE_URL="http://localhost:4000"
+export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"
+export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"
+export ANTHROPIC_API_KEY=""
+alias ll='ls -l'
+EOF
+out="$(sbx_install 2>&1)"
+assert_contains "rc migration is announced" "migrating $SBX/.bashrc" "$out"
+assert_contains "rc carries the Logfare token" \
+  'export ANTHROPIC_AUTH_TOKEN="lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"' "$(cat "$SBX/.bashrc")"
+assert_contains "rc drops the retired model" \
+  'export ANTHROPIC_MODEL="deepseek-v4.1-flash"' "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps unrelated exports" "export EDITOR=vim" "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps aliases" "alias ll='ls -l'" "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps the PATH marker block" "# >>> zim-claude >>>" "$(cat "$SBX/.bashrc")"
+if grep -q 'tj_legacy-token\|Flash-1017' "$SBX/.bashrc"; then
+  fail "rc migration leaves no Token Juice remnants" "old token or model survived"
+else pass "rc migration leaves no Token Juice remnants"; fi
+if compgen -G "$SBX/.local/share/zim-claude/backups/*/.bashrc" >/dev/null; then
+  pass "rc migration backs up the file"
+else fail "rc migration backs up the file" "no .bashrc backup found"; fi
+
+# Any other credential is the user's own: report it, never rewrite it.
+printf 'export ANTHROPIC_AUTH_TOKEN="sk-someone-elses-key"\n' > "$SBX/.bashrc"
+out="$(sbx_install 2>&1)"
+assert_contains "a foreign rc token is left alone" "sk-someone-elses-key" "$(cat "$SBX/.bashrc")"
+assert_contains "a foreign rc token is still reported" \
+  "exports ANTHROPIC_*" "$out"
+
+# --no-rc must not touch the shell config at all, migration included.
+printf 'export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"\n' > "$SBX/.bashrc"
+out="$(sbx_install --no-rc 2>&1)"
+assert_contains "--no-rc keeps the tj_ token" "tj_legacy-token" "$(cat "$SBX/.bashrc")"
+assert_contains "--no-rc says why" "left alone (--no-rc)" "$out"
 
 # Restore the shipped profile for the wrapper tests below.
 cp "$SBX/good-profile" "$SBX/claude-source/deepseek-claude"
@@ -545,7 +662,7 @@ mkdir -p "$PREREQ_SBX/bin"
 ln -sf "$STUB" "$PREREQ_SBX/bin/claude"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$PREREQ_SBX/bin/litellm"
 chmod +x "$PREREQ_SBX/bin/litellm"
-env -i HOME="$PREREQ_SBX" PATH="$PREREQ_SBX/bin:/usr/bin:/bin" TERM=dumb \
+env -i HOME="$PREREQ_SBX" PATH="$PREREQ_SBX/bin:$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" </dev/null >/dev/null 2>&1
 assert_eq "installer exits 0 when prereqs present" "0" "$?"
 [[ -x "$PREREQ_SBX/.local/bin/zim-claude" ]] && pass "wrapper installed in clean sandbox" \
@@ -583,7 +700,7 @@ section "proxy virtualenv"
 # unasked. This is the `curl | bash` path, and the one that used to advise
 # `pip install --break-system-packages`.
 VENV_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-venv-XXXXXX")"
-out="$(env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" </dev/null 2>&1)"
 assert_eq "no-litellm install still exits 1 for prereqs" "1" "$?"
 assert_contains "installer reports it skipped the venv" "skipping the proxy virtualenv" "$out"
@@ -595,7 +712,7 @@ assert_contains "installer says the proxy has no litellm" "no litellm to run" "$
   || pass "no venv built without consent"
 
 # --no-venv must never even offer to build one.
-out="$(env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" --no-venv </dev/null 2>&1)"
 assert_contains "--no-venv reports the venv as disabled" "proxy virtualenv disabled" "$out"
 
@@ -627,7 +744,7 @@ printf '#!/bin/sh\nexit 0\n' > "$VENV_SBX/.local/share/zim-claude/venv/bin/litel
 chmod +x "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
 printf '%s\n' 'litellm[proxy]>=1.100.1 uvloop>=0.22.1' \
   > "$VENV_SBX/.local/share/zim-claude/venv/.litellm-req"
-out="$(env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" </dev/null 2>&1)"
 assert_contains "existing venv is found, not rebuilt" "existing virtualenv" "$out"
 # This sandbox has no `claude`, so the install still exits 1 for that reason —
@@ -657,7 +774,7 @@ assert_eq "proxy resolves the venv litellm when nothing is on PATH" \
 
 # The stamp is the ownership marker --uninstall keys on. A venv carrying it is
 # ours and goes; the credential beside it still must not.
-env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" --uninstall </dev/null >/dev/null 2>&1
 [[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
   && fail "uninstall removes the venv it built" "venv still present" \
@@ -669,7 +786,7 @@ env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
 mkdir -p "$VENV_SBX/.local/share/zim-claude/venv/bin"
 printf '#!/bin/sh\nexit 0\n' > "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
 chmod +x "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
-env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" --uninstall </dev/null >/dev/null 2>&1
 [[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
   && pass "uninstall keeps a venv it did not build" \

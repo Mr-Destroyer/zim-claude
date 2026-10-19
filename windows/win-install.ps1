@@ -35,6 +35,9 @@
 .PARAMETER Uninstall
   Remove what this installer created. Your credential is never removed.
 
+.PARAMETER Port
+  Use this proxy port instead of probing for one.
+
 .PARAMETER Help
   Show this help.
 
@@ -53,6 +56,7 @@ param(
   [switch]$Force,
   [switch]$DryRun,
   [switch]$Uninstall,
+  [int]$Port = 0,
   [switch]$Help
 )
 
@@ -105,6 +109,12 @@ $DeskConfigDir = Join-Path $StateDir 'desktop'
 $DeskConfig    = Join-Path $DeskConfigDir 'litellm-config.desktop.yaml'
 
 $UpdateConf    = Join-Path $StateDir 'update.json'
+
+# The credential and port this install ends up with. Read by the conflict check
+# (so it does not warn about values it just wrote) and by the shell-profile
+# migration. Set by Install-EnvProfile.
+$script:EffectiveToken = ''
+$script:EffectivePort  = 4000
 
 # Values printed for the Claude Desktop dialog. The desktop proxy config reads
 # the same env var the CLI config does, so one profile serves both and the
@@ -210,6 +220,87 @@ function Install-File {
 
 # The env file is special: it holds a live credential, so it is never
 # overwritten - not even with -Force. Losing it would mean re-issuing a token.
+# --- choosing a proxy port ---------------------------------------------------
+#
+# Mirrors install.sh. The profile points claude at a local proxy, and a proxy
+# that rejects the profile's token looks exactly like a broken install: every
+# request answers "No connected db." Another LiteLLM (ZimZilla's, a leftover
+# install) holding :4000 is the usual cause.
+
+$PortCandidates = @(4000, 4001, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010)
+
+# Something is listening on the port. A connection error is the "free" signal.
+function Test-PortOpen {
+  param([int]$Candidate)
+  try {
+    $c = New-Object Net.Sockets.TcpClient
+    $iar = $c.BeginConnect('127.0.0.1', $Candidate, $null, $null)
+    $ok = $iar.AsyncWaitHandle.WaitOne(400, $false)
+    if ($ok -and $c.Connected) { $c.Close(); return $true }
+    $c.Close()
+    return $false
+  } catch { return $false }
+}
+
+# A LiteLLM started with a master key matching the token answers /v1/models
+# with 200. A mismatched master key answers 400; an unauthenticated service 401.
+function Test-ProxyAcceptsToken {
+  param([int]$Candidate, [string]$Token)
+  if ([string]::IsNullOrEmpty($Token)) { return $false }
+  try {
+    $r = Invoke-WebRequest -Uri "http://127.0.0.1:$Candidate/v1/models" `
+          -Headers @{ Authorization = "Bearer $Token" } `
+          -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+    return ($r.StatusCode -eq 200)
+  } catch { return $false }
+}
+
+function Get-PortFromUrl {
+  param([string]$Url)
+  if ($Url -match ':([0-9]+)') { return [int]$Matches[1] }
+  return 4000
+}
+
+# Returns the port to write into the profile.
+function Select-ProxyPort {
+  param([string]$Token, [string]$CurrentUrl)
+
+  if ($Port -gt 0) {
+    Write-Say "proxy port: $Port (-Port)"
+    return $Port
+  }
+
+  if (-not [string]::IsNullOrEmpty($CurrentUrl)) {
+    $current = Get-PortFromUrl -Url $CurrentUrl
+    if (Test-ProxyAcceptsToken -Candidate $current -Token $Token) {
+      Write-Say "proxy port: $current (already accepting the profile's token)"
+      return $current
+    }
+    if (-not (Test-PortOpen -Candidate $current)) {
+      Write-Say "proxy port: $current (free - zim-claude will start the proxy there)"
+      return $current
+    }
+    Write-Warn "port :$current is taken by something that rejects the profile's token"
+  }
+
+  foreach ($p in $PortCandidates) {
+    if (Test-ProxyAcceptsToken -Candidate $p -Token $Token) {
+      Write-Say "proxy port: $p (a running proxy already accepts the token)"
+      return $p
+    }
+  }
+  foreach ($p in $PortCandidates) {
+    if (-not (Test-PortOpen -Candidate $p)) {
+      Write-Say "proxy port: $p (free)"
+      return $p
+    }
+  }
+
+  Write-Warn "every candidate port is busy and none accepts the token."
+  Write-Warn "  falling back to :4000 - pass -Port N to choose another."
+  return 4000
+}
+
 function Install-EnvProfile {
   Invoke-Step "mkdir $HomeSrc" { New-Item -ItemType Directory -Force -Path $HomeSrc | Out-Null }
 
@@ -233,37 +324,62 @@ function Install-EnvProfile {
     } catch { $token = '' }
   }
 
+  $port = 0
+
   if (Test-Path -LiteralPath $EnvFile) {
     # A legacy Token Juice profile (tj_ key) is useless against Logfare: the
     # proxy forwards the key upstream and every request 401s, so the install
     # would look fine and fail on first use. That one case is migrated, with a
     # backup. Any other credential is the user's own and is left alone.
     $current = ''
+    $currentUrl = ''
     foreach ($line in Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue) {
-      if ($line -match '^export\s+ANTHROPIC_AUTH_TOKEN="(.*)"$') {
-        $current = $Matches[1]
-        break
+      if ($line -match '^export\s+ANTHROPIC_AUTH_TOKEN="(.*)"$') { $current = $Matches[1] }
+      if ($line -match '^export\s+ANTHROPIC_BASE_URL="(.*)"$')  { $currentUrl = $Matches[1] }
+    }
+
+    if ($current -like 'lfu_*') {
+      # A Logfare profile. Keep the credential; make sure its port works.
+      $port = Select-ProxyPort -Token $current -CurrentUrl $currentUrl
+      if ([string]::IsNullOrEmpty($currentUrl) -or ($port -eq (Get-PortFromUrl -Url $currentUrl))) {
+        Write-Say "keeping existing env file: $EnvFile (never overwritten)"
+        $script:EffectiveToken = $current
+        $script:EffectivePort  = $port
+        return $true
       }
-    }
+      Backup-IfExists -Path $EnvFile
+      Write-Say "moving the env profile to port :$port (it rejected its token on :$(Get-PortFromUrl -Url $currentUrl))"
+      if ($DryRun) {
+        Write-Host "    would rewrite ANTHROPIC_BASE_URL to http://localhost:$port"
+        return $true
+      }
+      # Keep the profile's own credential, not the repo's.
+      $token = $current
+      # Fall through to the writer below.
 
-    if ($current -notlike 'tj_*') {
+    } elseif ($current -notlike 'tj_*') {
       Write-Say "keeping existing env file: $EnvFile (never overwritten)"
+      $script:EffectiveToken = $current
+      if (-not [string]::IsNullOrEmpty($currentUrl)) { $script:EffectivePort = Get-PortFromUrl -Url $currentUrl }
       return $true
+    } else {
+      if ([string]::IsNullOrEmpty($token)) {
+        Write-Err "existing env file has a Token Juice token, but $SrcDir\config\token is missing"
+        Write-Err "  cannot migrate it to Logfare - re-clone or restore config\token"
+        return $false
+      }
+      $port = Select-ProxyPort -Token $token -CurrentUrl $currentUrl
+      Backup-IfExists -Path $EnvFile
+      Write-Say "migrating env file from Token Juice to Logfare: $EnvFile"
+      if ($DryRun) {
+        Write-Host "    would rewrite 4 ANTHROPIC_* exports (token redacted)"
+        return $true
+      }
+      # Fall through to the writer below, which overwrites the file wholesale.
     }
-
-    if ([string]::IsNullOrEmpty($token)) {
-      Write-Err "existing env file has a Token Juice token, but $SrcDir\config\token is missing"
-      Write-Err "  cannot migrate it to Logfare - re-clone or restore config\token"
-      return $false
-    }
-    Backup-IfExists -Path $EnvFile
-    Write-Say "migrating env file from Token Juice to Logfare: $EnvFile"
-    if ($DryRun) {
-      Write-Host "    would rewrite 4 ANTHROPIC_* exports (token redacted)"
-      return $true
-    }
-    # Fall through to the writer below, which overwrites the file wholesale.
   }
+
+  if ($port -eq 0) { $port = Select-ProxyPort -Token $token }
 
   if ([string]::IsNullOrEmpty($token)) {
     Write-Err "no token found in $SrcDir\config\"
@@ -285,14 +401,16 @@ function Install-EnvProfile {
   # Written in POSIX `export` syntax, byte-compatible with the Linux profile so
   # the same file works on both platforms and in Git Bash.
   $content = @(
-    'export ANTHROPIC_BASE_URL="http://localhost:4000"'
+    "export ANTHROPIC_BASE_URL=`"http://localhost:$port`""
     "export ANTHROPIC_AUTH_TOKEN=`"$token`""
     'export ANTHROPIC_MODEL="deepseek-v4.1-flash"'
     'export ANTHROPIC_API_KEY=""'
   ) -join "`n"
   # Explicit LF, no BOM: a CRLF here would put a CR inside the token.
   [IO.File]::WriteAllText($EnvFile, $content + "`n", (New-Object Text.UTF8Encoding $false))
-  Write-Ok "wrote $EnvFile"
+  Write-Ok "wrote $EnvFile (port $port)"
+  $script:EffectiveToken = $token
+  $script:EffectivePort  = $port
   return $true
 }
 
@@ -534,6 +652,61 @@ function Add-UserPath {
   }
 }
 
+# --- the user's shell profile ------------------------------------------------
+#
+# The PowerShell profile commonly carries the same ANTHROPIC_* assignments.
+# After a Token Juice -> Logfare move they point at a dead provider: a tj_ key,
+# a model Logfare no longer serves, and the old port. Plain `claude` would use
+# them and fail. Only a tj_ token triggers a rewrite; any other credential is
+# reported by Test-Conflicts, never changed.
+function Update-ShellProfile {
+  param([string]$Token, [int]$ProxyPort)
+  if ([string]::IsNullOrEmpty($Token)) { return }
+
+  $profiles = @(
+    (Join-Path $env:USERPROFILE 'Documents\WindowsPowerShell\Microsoft.PowerShell_profile.ps1'),
+    (Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1')
+  )
+
+  foreach ($p in $profiles) {
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+
+    $lines = @(Get-Content -LiteralPath $p)
+    $rcToken = ''
+    foreach ($line in $lines) {
+      if ($line -match '^\s*\$env:ANTHROPIC_AUTH_TOKEN\s*=\s*["'']?(.*?)["'']?\s*$') {
+        $rcToken = $Matches[1]
+        break
+      }
+    }
+    if ($rcToken -notlike 'tj_*') { continue }
+
+    Backup-IfExists -Path $p
+    Write-Say "migrating $p from Token Juice to Logfare"
+    if ($DryRun) {
+      Write-Host "    would rewrite the ANTHROPIC_* assignments (token redacted)"
+      continue
+    }
+
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($line in $lines) {
+      if ($line -match '^\s*\$env:ANTHROPIC_BASE_URL\s*=') {
+        $out.Add("`$env:ANTHROPIC_BASE_URL = `"http://localhost:$ProxyPort`"")
+      } elseif ($line -match '^\s*\$env:ANTHROPIC_AUTH_TOKEN\s*=') {
+        $out.Add("`$env:ANTHROPIC_AUTH_TOKEN = `"$Token`"")
+      } elseif ($line -match '^\s*\$env:ANTHROPIC_MODEL\s*=') {
+        $out.Add('$env:ANTHROPIC_MODEL = "deepseek-v4.1-flash"')
+      } elseif ($line -match '^\s*\$env:ANTHROPIC_API_KEY\s*=') {
+        $out.Add('$env:ANTHROPIC_API_KEY = ""')
+      } else {
+        $out.Add($line)
+      }
+    }
+    [IO.File]::WriteAllText($p, ($out -join "`r`n") + "`r`n", (New-Object Text.UTF8Encoding $false))
+    Write-Ok "updated $p (port $ProxyPort)"
+  }
+}
+
 # --- advisory conflict checks (warn only - never mutate) ---------------------
 
 function Test-Conflicts {
@@ -542,10 +715,16 @@ function Test-Conflicts {
     (Join-Path $env:USERPROFILE 'Documents\PowerShell\Microsoft.PowerShell_profile.ps1')
   )
   foreach ($p in $profilePaths) {
-    if ((Test-Path -LiteralPath $p) -and (Select-String -LiteralPath $p -Pattern 'ANTHROPIC_' -Quiet)) {
-      Write-Warn "$p sets ANTHROPIC_* - plain 'claude' uses that provider."
-      Write-Warn "'zim-claude' overrides it for its own process only."
+    if (-not (Test-Path -LiteralPath $p)) { continue }
+    if (-not (Select-String -LiteralPath $p -Pattern 'ANTHROPIC_' -Quiet)) { continue }
+    # After a migration the file holds OUR values; warning about them would be
+    # noise about a conflict that no longer exists.
+    if (-not [string]::IsNullOrEmpty($script:EffectiveToken) -and
+        (Select-String -LiteralPath $p -Pattern ([regex]::Escape($script:EffectiveToken)) -Quiet)) {
+      continue
     }
+    Write-Warn "$p sets ANTHROPIC_* - plain 'claude' uses that provider."
+    Write-Warn "'zim-claude' overrides it for its own process only."
   }
 
   # Claude Code applies a settings.json "env" block AFTER inheriting the process
@@ -642,6 +821,7 @@ if (-not $SkipCli -or -not $SkipDesktop) {
   Install-File -Src (Join-Path $WinDir 'start-proxies.ps1') -Dest (Join-Path $BinDir 'start-proxies.ps1') -Scope 'shared' | Out-Null
   Install-File -Src (Join-Path $WinDir 'start-proxies.cmd') -Dest (Join-Path $BinDir 'start-proxies.cmd') -Scope 'shared' | Out-Null
   Install-EnvProfile | Out-Null
+  Update-ShellProfile -Token $script:EffectiveToken -ProxyPort $script:EffectivePort
 }
 
 if (-not $SkipDesktop) {

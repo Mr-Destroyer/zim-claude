@@ -10,7 +10,7 @@
   through environment variables only.
 
     LITELLM_ENV_FILE            profile to source   (default %USERPROFILE%\claude-source\deepseek-claude)
-    LITELLM_PORT                proxy port         (default 4000)
+    LITELLM_PORT                proxy port         (default: the port in the profile)
     ZIM_CLAUDE_BIN              claude executable  (default: claude on PATH)
     ZIM_CLAUDE_NO_PROXY=1       never touch the proxy
     ZIM_CLAUDE_REQUIRE_PROXY=1  hard-fail if the proxy is not healthy
@@ -37,8 +37,13 @@ $SelfDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 if ($env:LITELLM_ENV_FILE) { $EnvFile = $env:LITELLM_ENV_FILE }
 else { $EnvFile = Join-Path $env:USERPROFILE 'claude-source\deepseek-claude' }
 
+# The profile chooses the port. Only an explicit LITELLM_PORT overrides it:
+# the installer probes for a port whose proxy accepts this profile's token, so
+# a hardcoded 4000 here would check (and start) a proxy the profile does not
+# use, and warn on every run on a machine where another proxy owns :4000.
+$portExplicit = -not [string]::IsNullOrEmpty($env:LITELLM_PORT)
 $Port = 4000
-if ($env:LITELLM_PORT) { $Port = [int]$env:LITELLM_PORT }
+if ($portExplicit) { $Port = [int]$env:LITELLM_PORT }
 
 $Service = Join-Path $SelfDir 'start-proxies.ps1'
 
@@ -123,6 +128,11 @@ if ($prevBaseUrl -and $prevBaseUrl -ne $baseUrl) {
   Write-Warn "overriding inherited ANTHROPIC_BASE_URL=$prevBaseUrl -> $baseUrl"
 }
 
+# Follow the profile's port unless the caller named one explicitly.
+if (-not $portExplicit -and $baseUrl -match ':([0-9]+)') {
+  $Port = [int]$Matches[1]
+}
+
 # --- only manage a proxy when the profile points at the local one ------------
 
 if ($baseUrl -notmatch "localhost:$Port" -and $baseUrl -notmatch "127\.0\.0\.1:$Port") {
@@ -151,8 +161,17 @@ function Ensure-Proxy {
 
   Write-Info "LiteLLM proxy not answering on :$Port - starting it..."
   # A subprocess, never dot-sourced: start-proxies.ps1 ends in a switch that
-  # runs on load and calls exit.
-  & powershell -NoProfile -ExecutionPolicy Bypass -File $Service start -Which cli | Out-Null
+  # runs on load and calls exit. The port is passed because the profile, not
+  # this script's default, chose it; the variable is restored afterwards so
+  # claude does not inherit our bookkeeping.
+  $prevPortEnv = $env:LITELLM_PORT
+  $env:LITELLM_PORT = "$Port"
+  try {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File $Service start -Which cli | Out-Null
+  } finally {
+    if ([string]::IsNullOrEmpty($prevPortEnv)) { Remove-Item Env:\LITELLM_PORT -ErrorAction SilentlyContinue }
+    else { $env:LITELLM_PORT = $prevPortEnv }
+  }
   if (Test-ProxyHealthy) { Write-Info "proxy is up."; return $true }
 
   Write-Warn "could not start the proxy - see the log under .local\share\zim-claude\logs\"

@@ -5,7 +5,7 @@
 <p><strong>Claude Code, pointed at a local LiteLLM proxy.</strong></p>
 
 <p>Same flags, same subcommands, same interactive UI as <code>claude</code> —<br>
-it just talks to a proxy on <code>localhost:4000</code> instead of Anthropic.</p>
+it just talks to a local proxy instead of Anthropic.</p>
 
 <p>
 <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-2f81f7?style=flat-square" alt="Platform"></a>
@@ -39,6 +39,9 @@ about 8 ms once it is already up.
    zim-claude          (local)                        (model)
 ```
 
+The port is auto-detected at install time and recorded in the profile; `:4000` is the
+usual result. See [Which port it picks](#which-port-it-picks).
+
 ---
 
 ## Install
@@ -66,8 +69,8 @@ That's it. Open a new terminal and run `zim-claude`.
 
 | Installer | Platform | What it sets up | Run it with |
 |---|---|---|---|
-| `install.sh` | Linux · macOS · WSL | CLI proxy `:4000` + the `zim-claude` command | `./install.sh` |
-| `windows\win-install.bat` | Windows | **both** proxies — `:4000` *and* the `:4002` gateway — plus `zim-claude` | `win-install.bat` |
+| `install.sh` | Linux · macOS · WSL | CLI proxy (port auto-detected) + the `zim-claude` command | `./install.sh` |
+| `windows\win-install.bat` | Windows | **both** proxies — the CLI proxy *and* the `:4002` gateway — plus `zim-claude` | `win-install.bat` |
 | `claude-desktop-integration/install.sh` | Linux · macOS | the `:4002` gateway only | `cd claude-desktop-integration && ./install.sh` |
 
 You normally only need the first one for your platform. The third exists for people who
@@ -164,6 +167,7 @@ Anything it would overwrite is backed up first, under
 ./install.sh --no-rc        don't touch ~/.bashrc
 ./install.sh --start        start the proxy when done
 ./install.sh --no-venv      never build the proxy virtualenv
+./install.sh --port N       use port N instead of auto-detecting one
 ```
 
 Re-running `install.sh` is safe and idempotent — it compares file contents and skips
@@ -183,6 +187,38 @@ in place.
 starting with `tj_`). Those keys are useless against Logfare, so the installer backs the
 file up and replaces it with the shipped Logfare token; any other credential is left
 alone.
+
+It also repairs a profile that points at a port which **rejects its own token**. That
+happens when another LiteLLM — ZimZilla's, a leftover install — already owns `:4000`
+and answers every request with `No connected db.` The token is fine, the port is not,
+so the installer backs the profile up and moves only `ANTHROPIC_BASE_URL`.
+
+### Which port it picks
+
+The installer probes the local ports and writes the one that works into the profile:
+
+| Found | Result |
+|---|---|
+| The profile's port already accepts the token | keep it |
+| The profile's port is free | keep it — `zim-claude` starts its own proxy there |
+| The profile's port is held by a proxy that rejects the token | move to a port that accepts it |
+| No proxy accepts the token anywhere | take the first free port |
+
+Candidates are `4000`, `4001`, then `4003`–`4010` (`4002` is the Claude Desktop
+gateway). Override the whole search with `--port N`.
+
+The wrapper follows the profile's port, so a profile moved to `:4001` works with no
+environment variable set. `LITELLM_PORT` still wins when you set it explicitly.
+
+### The shell config
+
+A `tj_` token in `~/.bashrc` is a dead provider for plain `claude`. The installer backs
+the file up and rewrites those four `ANTHROPIC_*` lines to the Logfare token, the
+auto-detected port, and a model that still exists. Everything else in the file — your
+aliases, your own exports, the `PATH` block — is untouched.
+
+Any other credential in the rc file is reported, never changed. `--no-rc` skips this
+migration along with the `PATH` block.
 
 ### Auto-update
 
@@ -234,7 +270,7 @@ together:
 
 | | CLI | Claude Desktop |
 |---|---|---|
-| Port | `4000` | `4002` |
+| Port | auto-detected (usually `4000`) | `4002` |
 | Config | `%USERPROFILE%\litellm-config.yaml` | `%USERPROFILE%\.local\share\zim-claude\desktop\litellm-config.desktop.yaml` |
 | Log | `%USERPROFILE%\.local\share\zim-claude\logs\cli.log` | `...\logs\desktop.log` |
 
@@ -257,10 +293,11 @@ forwarded to `claude.exe` untouched, and its exit code passes through — so
 ```
 win-install.bat                 install both sides, start the proxies
 win-install.bat -DryRun         print every action, change nothing
-win-install.bat -SkipDesktop    CLI proxy (:4000) only
+win-install.bat -SkipDesktop    CLI proxy only
 win-install.bat -SkipCli        Claude Desktop gateway (:4002) only
 win-install.bat -NoStart        install but don't start the proxies
 win-install.bat -Force          overwrite hand-edited files (backed up first)
+win-install.bat -Port N         use port N instead of auto-detecting one
 win-install.bat -Uninstall      remove what the installer created
 ```
 
@@ -290,7 +327,7 @@ execution policy blocks it anyway). `start-proxies.cmd` is what makes the plain
 command work: it passes `-ExecutionPolicy Bypass` for that one invocation, so your
 machine's policy is untouched. Every `.ps1` here has such a shim for the same reason.
 
-You normally never need these — `zim-claude` health-checks `localhost:4000` and starts
+You normally never need these — `zim-claude` health-checks the CLI proxy and starts
 the CLI proxy if it's down, exactly as on Linux.
 
 Windows gets the same auto-update as Linux: `zim-claude` starts
@@ -439,8 +476,8 @@ start-litellm.sh restart    # after editing the config
 start-litellm.sh stop
 ```
 
-You normally never need these — `zim-claude` health-checks `localhost:4000` and starts
-the proxy if it's down. The check costs ~8 ms when the proxy is already up.
+You normally never need these — `zim-claude` health-checks the port in the profile and
+starts the proxy if it's down. The check costs ~8 ms when the proxy is already up.
 
 `start-litellm.sh` finds litellm in this order, so an existing install is always
 preferred over the private venv:
@@ -460,7 +497,7 @@ through environment variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `LITELLM_ENV_FILE` | `~/claude-source/deepseek-claude` | profile to source |
-| `LITELLM_PORT` | `4000` | proxy port |
+| `LITELLM_PORT` | the profile's port | proxy port — set this to override the profile |
 | `LITELLM_LOG` | `/tmp/litellm-proxy.log` | proxy log |
 | `LITELLM_SERVICE` | `<install dir>/start-litellm.sh` | proxy manager |
 | `LITELLM_BIN` | (auto-detected) | pin an exact litellm binary |

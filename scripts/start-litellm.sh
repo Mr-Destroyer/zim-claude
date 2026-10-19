@@ -16,7 +16,10 @@ ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
 CONFIG="${LITELLM_CONFIG:-$HOME/litellm-config.yaml}"
 PORT="${LITELLM_PORT:-4000}"
 LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
-PID_FILE="${LITELLM_PID_FILE:-/tmp/litellm-proxy.pid}"
+# Per-port, so the CLI proxy and the Claude Desktop gateway (or a second
+# zim-claude install) cannot mistake each other for their own process. A shared
+# pid file would let `stop` kill the other proxy.
+PID_FILE="${LITELLM_PID_FILE:-/tmp/litellm-proxy-$PORT.pid}"
 
 # Where litellm comes from, in priority order:
 #   1. $LITELLM_BIN, if you set it
