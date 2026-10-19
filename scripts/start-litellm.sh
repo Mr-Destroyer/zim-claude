@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # start-litellm.sh — run the LiteLLM translation proxy for Claude Code
 #
-#   Claude Code (Anthropic /v1/messages) --▶ LiteLLM :4000 --▶ Token Juice (OpenAI)
+#   Claude Code (Anthropic /v1/messages) --▶ LiteLLM :4000 --▶ Logfare (OpenAI)
 #
 # Usage:  ./start-litellm.sh [start|stop|restart|status|logs|help]
 #

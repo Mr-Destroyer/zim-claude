@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # start-desktop-proxy.sh — dedicated LiteLLM proxy (:4002) for Claude Desktop.
 #
-#   Claude Desktop --> LiteLLM :4002 --> Token Juice (OpenAI) --> DeepSeek
+#   Claude Desktop --> LiteLLM :4002 --> Logfare (OpenAI) --> DeepSeek
 #
 # Runs on its own port so it NEVER disturbs the zim-claude CLI proxy on :4000.
 #

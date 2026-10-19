@@ -35,8 +35,8 @@ The proxy starts automatically the first time you use it, and the health check c
 about 8 ms once it is already up.
 
 ```
-  Claude Code  ──▶  LiteLLM :4000  ──▶  Token Juice  ──▶  upstream
-   zim-claude          (local)                            (model)
+  Claude Code  ──▶  LiteLLM :4000  ──▶  Logfare  ──▶  upstream
+   zim-claude          (local)                        (model)
 ```
 
 ---
@@ -175,6 +175,11 @@ so it is skipped and the installer says so — the CLI half still installs. Re-r
 and never touches your env profile or `~/litellm-config.yaml`. It removes the proxy
 virtualenv too — but only one this installer built; a venv you made yourself is left
 in place.
+
+**The one profile it will rewrite** is a legacy Token Juice one (`ANTHROPIC_AUTH_TOKEN`
+starting with `tj_`). Those keys are useless against Logfare, so the installer backs the
+file up and replaces it with the shipped Logfare token; any other credential is left
+alone.
 
 ---
 
@@ -548,7 +553,7 @@ Base64 was never protection anyway — `install.sh` had to reverse it, so anyone
 repo could too.
 
 Treat the repo as containing the credential. If it is ever pushed somewhere public,
-rotate the token at Token Juice rather than trying to scrub the history.
+rotate the token at Logfare rather than trying to scrub the history.
 
 `install.sh` still reads `config/.token.b64` if `config/token` is absent, so an older
 checkout keeps working.

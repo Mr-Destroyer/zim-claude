@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# zim-claude — run Claude Code against the local LiteLLM -> Token Juice route.
+# zim-claude — run Claude Code against the local LiteLLM -> Logfare route.
 #
 # Every argument is forwarded verbatim to `claude`. This script deliberately
 # parses NO options of its own: `zim-claude --help`, `zim-claude mcp list`,

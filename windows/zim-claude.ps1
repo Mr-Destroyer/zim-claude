@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Run Claude Code against the local LiteLLM -> Token Juice route on Windows.
+  Run Claude Code against the local LiteLLM -> Logfare route on Windows.
 
 .DESCRIPTION
   Windows counterpart of scripts/zim-claude. Every argument is forwarded
