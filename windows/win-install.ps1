@@ -261,6 +261,15 @@ function Get-PortFromUrl {
   return 4001
 }
 
+# The profile aims at a proxy on this machine. That is the only kind of profile
+# this installer manages; one aimed at a provider directly is the user's own and
+# is never rewritten.
+function Test-LocalProxyUrl {
+  param([string]$Url)
+  if ([string]::IsNullOrEmpty($Url)) { return $false }
+  return ($Url -match 'localhost:' -or $Url -match '127\.0\.0\.1:')
+}
+
 # Returns the port to write into the profile.
 function Select-ProxyPort {
   param([string]$Token, [string]$CurrentUrl)
@@ -327,10 +336,10 @@ function Install-EnvProfile {
   $port = 0
 
   if (Test-Path -LiteralPath $EnvFile) {
-    # A legacy Token Juice profile (tj_ key) is useless against Logfare: the
-    # proxy forwards the key upstream and every request 401s, so the install
-    # would look fine and fail on first use. That one case is migrated, with a
-    # backup. Any other credential is the user's own and is left alone.
+    # A profile aimed at the local proxy but carrying a key this repo did not
+    # issue is useless: the proxy only accepts Logfare keys, so the install
+    # would look fine and fail on first use. That one case is rewritten, with a
+    # backup. A profile aimed elsewhere is the user's own and is left alone.
     $current = ''
     $currentUrl = ''
     foreach ($line in Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue) {
@@ -357,25 +366,30 @@ function Install-EnvProfile {
       $token = $current
       # Fall through to the writer below.
 
-    } elseif ($current -notlike 'tj_*') {
-      Write-Say "keeping existing env file: $EnvFile (never overwritten)"
-      $script:EffectiveToken = $current
-      if (-not [string]::IsNullOrEmpty($currentUrl)) { $script:EffectivePort = Get-PortFromUrl -Url $currentUrl }
-      return $true
-    } else {
+    } elseif ((Test-LocalProxyUrl -Url $currentUrl) -and ($current -ne $token)) {
+      # Aimed at the local proxy, but carrying a key this repo did not issue.
+      # The proxy will reject it, so replace the credential with the shipped
+      # one rather than leave a profile that looks fine and fails on first use.
       if ([string]::IsNullOrEmpty($token)) {
-        Write-Err "existing env file has a Token Juice token, but $SrcDir\config\token is missing"
-        Write-Err "  cannot migrate it to Logfare - re-clone or restore config\token"
+        Write-Err "existing env file points at the local proxy with an unknown key,"
+        Write-Err "  but $SrcDir\config\token is missing - re-clone or restore it"
         return $false
       }
       $port = Select-ProxyPort -Token $token -CurrentUrl $currentUrl
       Backup-IfExists -Path $EnvFile
-      Write-Say "migrating env file from Token Juice to Logfare: $EnvFile"
+      Write-Say "replacing an unrecognised key in $EnvFile with the shipped Logfare token"
       if ($DryRun) {
         Write-Host "    would rewrite 4 ANTHROPIC_* exports (token redacted)"
         return $true
       }
       # Fall through to the writer below, which overwrites the file wholesale.
+    } else {
+      # Someone else's credential, or a profile aimed at another provider.
+      # Leave it exactly as it is.
+      Write-Say "keeping existing env file: $EnvFile (never overwritten)"
+      $script:EffectiveToken = $current
+      if (-not [string]::IsNullOrEmpty($currentUrl)) { $script:EffectivePort = Get-PortFromUrl -Url $currentUrl }
+      return $true
     }
   }
 
@@ -655,10 +669,10 @@ function Add-UserPath {
 # --- the user's shell profile ------------------------------------------------
 #
 # The PowerShell profile commonly carries the same ANTHROPIC_* assignments.
-# After a Token Juice -> Logfare move they point at a dead provider: a tj_ key,
-# a model Logfare no longer serves, and the old port. Plain `claude` would use
-# them and fail. Only a tj_ token triggers a rewrite; any other credential is
-# reported by Test-Conflicts, never changed.
+# If they aim at the local proxy but carry a key this repo did not issue, plain
+# `claude` would use them and fail on every request. Only that case triggers a
+# rewrite; a profile aimed elsewhere, or already carrying our key, is reported
+# by Test-Conflicts and never changed.
 function Update-ShellProfile {
   param([string]$Token, [int]$ProxyPort)
   if ([string]::IsNullOrEmpty($Token)) { return }
@@ -673,16 +687,17 @@ function Update-ShellProfile {
 
     $lines = @(Get-Content -LiteralPath $p)
     $rcToken = ''
+    $rcUrl   = ''
     foreach ($line in $lines) {
-      if ($line -match '^\s*\$env:ANTHROPIC_AUTH_TOKEN\s*=\s*["'']?(.*?)["'']?\s*$') {
-        $rcToken = $Matches[1]
-        break
-      }
+      if ($line -match '^\s*\$env:ANTHROPIC_AUTH_TOKEN\s*=\s*["'']?(.*?)["'']?\s*$') { $rcToken = $Matches[1] }
+      if ($line -match '^\s*\$env:ANTHROPIC_BASE_URL\s*=\s*["'']?(.*?)["'']?\s*$')  { $rcUrl   = $Matches[1] }
     }
-    if ($rcToken -notlike 'tj_*') { continue }
+    if ([string]::IsNullOrEmpty($rcToken)) { continue }
+    if (-not (Test-LocalProxyUrl -Url $rcUrl)) { continue }
+    if ($rcToken -eq $Token) { continue }
 
     Backup-IfExists -Path $p
-    Write-Say "migrating $p from Token Juice to Logfare"
+    Write-Say "replacing the stale key in $p with the shipped Logfare token"
     if ($DryRun) {
       Write-Host "    would rewrite the ANTHROPIC_* assignments (token redacted)"
       continue

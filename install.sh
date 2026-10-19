@@ -215,6 +215,13 @@ port_from_url() {
   if [[ "$port" =~ ^[0-9]+$ ]]; then printf '%s' "$port"; else printf '%s' "$PROXY_PORT_DEFAULT"; fi
 }
 
+# points_at_local_proxy <url> — the profile aims at a proxy on this machine.
+# That is the only kind of profile this installer manages; one aimed at a
+# provider directly is the user's own and is never rewritten.
+points_at_local_proxy() {
+  [[ "$1" == *localhost:* || "$1" == *127.0.0.1:* ]]
+}
+
 # choose_proxy_port <token> [<current-url>] — sets PROXY_PORT_CHOSEN.
 choose_proxy_port() {
   local token="$1" current_url="${2:-}" current_port="" p
@@ -271,15 +278,16 @@ choose_proxy_port() {
 #
 # Two exceptions are repaired, each with a backup:
 #
-#   - a legacy Token Juice profile (tj_ key). Token Juice keys are useless
-#     against Logfare (the proxy forwards them upstream and every request
-#     401s), so the install would look fine and fail on first use.
+#   - a profile aimed at the local proxy that carries a key this repo did not
+#     issue. The proxy only accepts Logfare keys, so such a profile would
+#     install cleanly and then fail on first use.
 #   - a Logfare profile whose base URL points at a port that rejects its own
 #     token. That is a real machine: another proxy holds the port and answers
 #     "No connected db." The token is fine, the port is not, so only the port
 #     is moved.
 #
-# Any other credential is the user's own and is left alone.
+# A profile aimed somewhere other than the local proxy is the user's own and is
+# left alone.
 install_config_env() {
   run mkdir -p -- "$HOME_SRC_DIR"
   run chmod 700 -- "$HOME_SRC_DIR"
@@ -305,25 +313,7 @@ install_config_env() {
     current="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
     current_url="$(sed -n 's/^export ANTHROPIC_BASE_URL="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
 
-    if [[ "$current" == tj_* ]]; then
-      # A Token Juice credential. Replace it with the shipped Logfare token.
-      if [[ -z "$token" ]]; then
-        err "existing env file has a Token Juice token, but $SRC_DIR/config/token is missing"
-        err "  cannot migrate it to Logfare — re-clone or restore config/token"
-        return 1
-      fi
-      backup_if_exists "$ENV_FILE"
-      say "migrating env file from Token Juice to Logfare: $ENV_FILE"
-      choose_proxy_port "$token" "$current_url"
-      if (( DRY_RUN )); then
-        printf '    would rewrite 4 ANTHROPIC_* exports (token redacted)\n'
-        return 0
-      fi
-      # Fall through to the writer below; it overwrites the file wholesale, so
-      # nothing from the Token Juice profile (including ANTHROPIC_MODEL) survives.
-      : >"$ENV_FILE"
-
-    elif [[ "$current" == lfu_* ]]; then
+    if [[ "$current" == lfu_* ]]; then
       # A Logfare profile. Keep the credential; make sure its port works.
       PROFILE_TOKEN_EFFECTIVE="$current"
       choose_proxy_port "$current" "$current_url"
@@ -342,8 +332,30 @@ install_config_env() {
       : >"$ENV_FILE"
       token="$current"
 
+    elif [[ -n "$current_url" ]] && points_at_local_proxy "$current_url" && \
+         [[ "$current" != "$token" ]]; then
+      # Aimed at the local proxy, but carrying a key this repo did not issue.
+      # The proxy will reject it, so replace the credential with the shipped
+      # one rather than leave a profile that looks fine and fails on first use.
+      if [[ -z "$token" ]]; then
+        err "existing env file points at the local proxy with an unknown key,"
+        err "  but $SRC_DIR/config/token is missing — re-clone or restore it"
+        return 1
+      fi
+      backup_if_exists "$ENV_FILE"
+      say "replacing an unrecognised key in $ENV_FILE with the shipped Logfare token"
+      choose_proxy_port "$token" "$current_url"
+      if (( DRY_RUN )); then
+        printf '    would rewrite 4 ANTHROPIC_* exports (token redacted)\n'
+        return 0
+      fi
+      # Fall through to the writer below; it overwrites the file wholesale, so
+      # nothing from the old profile (including ANTHROPIC_MODEL) survives.
+      : >"$ENV_FILE"
+
     else
-      # Someone else's credential. Leave it exactly as it is.
+      # Someone else's credential, or a profile aimed at another provider.
+      # Leave it exactly as it is.
       say "keeping existing env file: $ENV_FILE (never overwritten)"
       run chmod 600 -- "$ENV_FILE"
       PROFILE_TOKEN_EFFECTIVE="$current"
@@ -386,33 +398,36 @@ EOF
 # --- the user's shell rc -----------------------------------------------------
 #
 # ~/.bashrc commonly carries the same four ANTHROPIC_* exports, added by hand
-# or by an older install. After a Token Juice -> Logfare move they point at a
-# dead provider: a tj_ key, a model Logfare no longer serves, and the old port.
-# Plain `claude` would use them and fail.
+# or by an older install. If they aim at the local proxy but carry a key this
+# repo did not issue, plain `claude` would use them and fail on every request.
 #
-# Only a tj_ token triggers a rewrite. Any other credential is the user's own;
-# it is reported by check_conflicts, never changed.
+# Only that case triggers a rewrite. A profile aimed at another provider, or
+# already carrying our key, is the user's own; it is reported by
+# check_conflicts, never changed.
 migrate_shell_rc() {
   local rc="$HOME/.bashrc"
   [[ -f "$rc" ]] || return 0
 
-  local rc_token=""
+  local rc_token="" rc_url=""
   rc_token="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$rc" 2>/dev/null | head -1)"
-  [[ "$rc_token" == tj_* ]] || return 0
+  rc_url="$(sed -n 's/^export ANTHROPIC_BASE_URL="\(.*\)"$/\1/p' "$rc" 2>/dev/null | head -1)"
+  [[ -n "$rc_token" ]] || return 0
+  [[ -n "$rc_url" ]] && points_at_local_proxy "$rc_url" || return 0
+  [[ "$rc_token" != "$PROFILE_TOKEN_EFFECTIVE" ]] || return 0
 
   # --no-rc means "do not touch my shell config", and that includes this.
   if (( ! TOUCH_RC )); then
-    warn "$rc still exports a Token Juice token (tj_...) — left alone (--no-rc)."
+    warn "$rc exports a stale key for the local proxy — left alone (--no-rc)."
     return 0
   fi
 
   if [[ -z "$PROFILE_TOKEN_EFFECTIVE" ]]; then
-    warn "$rc exports a Token Juice token, but no Logfare token is available to replace it."
+    warn "$rc exports a stale key for the local proxy, but no Logfare token is available to replace it."
     return 0
   fi
 
   backup_if_exists "$rc"
-  say "migrating $rc from Token Juice to Logfare"
+  say "replacing the stale key in $rc with the shipped Logfare token"
   if (( DRY_RUN )); then
     printf '    would rewrite the ANTHROPIC_* exports (token redacted)\n'
     return 0

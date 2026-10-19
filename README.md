@@ -183,10 +183,11 @@ and never touches your env profile or `~/litellm-config.yaml`. It removes the pr
 virtualenv too — but only one this installer built; a venv you made yourself is left
 in place.
 
-**The one profile it will rewrite** is a legacy Token Juice one (`ANTHROPIC_AUTH_TOKEN`
-starting with `tj_`). Those keys are useless against Logfare, so the installer backs the
-file up and replaces it with the shipped Logfare token; any other credential is left
-alone.
+**The one profile it will rewrite** is one aimed at the local proxy that carries a key
+this repo did not issue. The proxy only accepts Logfare keys, so such a profile would
+install cleanly and then fail on first use; the installer backs the file up and replaces
+the credential with the shipped Logfare token. A profile aimed at another provider is
+left alone.
 
 It also repairs a profile that points at a port which **rejects its own token**. That
 happens when another LiteLLM — ZimZilla's, a leftover install — already owns the port
@@ -212,12 +213,13 @@ environment variable set. `LITELLM_PORT` still wins when you set it explicitly.
 
 ### The shell config
 
-A `tj_` token in `~/.bashrc` is a dead provider for plain `claude`. The installer backs
-the file up and rewrites those four `ANTHROPIC_*` lines to the Logfare token, the
-auto-detected port, and a model that still exists. Everything else in the file — your
-aliases, your own exports, the `PATH` block — is untouched.
+An `ANTHROPIC_AUTH_TOKEN` in `~/.bashrc` that points at the local proxy but is not the
+shipped Logfare key is a dead provider for plain `claude`. The installer backs the file
+up and rewrites those four `ANTHROPIC_*` lines to the Logfare token, the auto-detected
+port, and a model that still exists. Everything else in the file — your aliases, your
+own exports, the `PATH` block — is untouched.
 
-Any other credential in the rc file is reported, never changed. `--no-rc` skips this
+A profile aimed at another provider is reported, never changed. `--no-rc` skips this
 migration along with the `PATH` block.
 
 ### Auto-update

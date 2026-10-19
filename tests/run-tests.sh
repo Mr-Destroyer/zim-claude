@@ -427,27 +427,37 @@ assert_contains "token survives --force" "sentinel-must-survive" \
 cp "$SBX/good-profile" "$SBX/claude-source/deepseek-claude"
 chmod 600 "$SBX/claude-source/deepseek-claude"
 
-section "Token Juice -> Logfare migration"
+section "stale local-proxy profile is repaired"
 
-# A profile carried over from the old upstream holds a tj_ key. Logfare
-# forwards it upstream and 401s every request, so leaving it alone would make
-# a successful install fail on first use. It is the one credential the
+# A profile aimed at the local proxy but carrying a key this repo did not issue
+# can only fail: the proxy accepts Logfare keys only. Leaving it alone would
+# make a successful install fail on first use. It is the one credential the
 # installer replaces - and it must take a backup first.
 printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/claude-source/deepseek-claude"
-printf 'export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"\n' >> "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="legacy-unissued-token"\n' >> "$SBX/claude-source/deepseek-claude"
 printf 'export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"\n' >> "$SBX/claude-source/deepseek-claude"
 out="$(sbx_install 2>&1)"
-assert_contains "legacy tj_ profile is migrated" "migrating env file from Token Juice to Logfare" "$out"
-assert_contains "migrated profile carries the Logfare token" \
+assert_contains "a stale local-proxy profile is repaired" \
+  "replacing an unrecognised key in" "$out"
+assert_contains "repaired profile carries the Logfare token" \
   "lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden" "$(cat "$SBX/claude-source/deepseek-claude")"
-assert_contains "migrated profile drops the stale model name" \
+assert_contains "repaired profile drops the stale model name" \
   'ANTHROPIC_MODEL="deepseek-v4.1-flash"' "$(cat "$SBX/claude-source/deepseek-claude")"
-if grep -q 'tj_legacy-token\|Flash-1017' "$SBX/claude-source/deepseek-claude"; then
-  fail "migration leaves no Token Juice remnants" "old token or model survived"
-else pass "migration leaves no Token Juice remnants"; fi
+if grep -q 'legacy-unissued-token\|Flash-1017' "$SBX/claude-source/deepseek-claude"; then
+  fail "repair leaves no stale remnants" "old token or model survived"
+else pass "repair leaves no stale remnants"; fi
 if compgen -G "$SBX/.local/share/zim-claude/backups/*/claude-source__deepseek-claude" >/dev/null; then
-  pass "migration backs up the old profile"
-else fail "migration backs up the old profile" "no backup of the tj_ profile found"; fi
+  pass "repair backs up the old profile"
+else fail "repair backs up the old profile" "no backup of the stale profile found"; fi
+
+# A profile aimed at another provider is the user's own: never rewritten.
+printf 'export ANTHROPIC_BASE_URL="https://api.example-provider.test/v1"\n' > "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="their-key"\n' >> "$SBX/claude-source/deepseek-claude"
+out="$(sbx_install 2>&1)"
+assert_contains "a profile aimed elsewhere keeps its key" "their-key" \
+  "$(cat "$SBX/claude-source/deepseek-claude")"
+assert_contains "a profile aimed elsewhere is reported as kept" \
+  "keeping existing env file" "$out"
 assert_eq "migrated profile is mode 600" "600" \
   "$(stat -c%a "$SBX/claude-source/deepseek-claude" 2>/dev/null)"
 
@@ -494,19 +504,20 @@ assert_contains "a working port is reported as working" \
 
 section "shell rc migration"
 
-# ~/.bashrc commonly holds the same four exports. A tj_ token there is a dead
-# provider for plain `claude`, so it is rewritten - with a backup.
+# ~/.bashrc commonly holds the same four exports. A stale key aimed at the
+# local proxy is a dead provider for plain `claude`, so it is rewritten - with
+# a backup.
 cat > "$SBX/.bashrc" <<'EOF'
 # user's own file
 export EDITOR=vim
 export ANTHROPIC_BASE_URL="http://localhost:4000"
-export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"
+export ANTHROPIC_AUTH_TOKEN="legacy-unissued-token"
 export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"
 export ANTHROPIC_API_KEY=""
 alias ll='ls -l'
 EOF
 out="$(sbx_install 2>&1)"
-assert_contains "rc migration is announced" "migrating $SBX/.bashrc" "$out"
+assert_contains "rc repair is announced" "replacing the stale key in $SBX/.bashrc" "$out"
 assert_contains "rc carries the Logfare token" \
   'export ANTHROPIC_AUTH_TOKEN="lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"' "$(cat "$SBX/.bashrc")"
 assert_contains "rc drops the retired model" \
@@ -514,24 +525,27 @@ assert_contains "rc drops the retired model" \
 assert_contains "rc keeps unrelated exports" "export EDITOR=vim" "$(cat "$SBX/.bashrc")"
 assert_contains "rc keeps aliases" "alias ll='ls -l'" "$(cat "$SBX/.bashrc")"
 assert_contains "rc keeps the PATH marker block" "# >>> zim-claude >>>" "$(cat "$SBX/.bashrc")"
-if grep -q 'tj_legacy-token\|Flash-1017' "$SBX/.bashrc"; then
-  fail "rc migration leaves no Token Juice remnants" "old token or model survived"
-else pass "rc migration leaves no Token Juice remnants"; fi
+if grep -q 'legacy-unissued-token\|Flash-1017' "$SBX/.bashrc"; then
+  fail "rc repair leaves no stale remnants" "old token or model survived"
+else pass "rc repair leaves no stale remnants"; fi
 if compgen -G "$SBX/.local/share/zim-claude/backups/*/.bashrc" >/dev/null; then
-  pass "rc migration backs up the file"
-else fail "rc migration backs up the file" "no .bashrc backup found"; fi
+  pass "rc repair backs up the file"
+else fail "rc repair backs up the file" "no .bashrc backup found"; fi
 
-# Any other credential is the user's own: report it, never rewrite it.
-printf 'export ANTHROPIC_AUTH_TOKEN="sk-someone-elses-key"\n' > "$SBX/.bashrc"
+# A profile aimed at another provider is the user's own: report it, never
+# rewrite it.
+printf 'export ANTHROPIC_BASE_URL="https://api.example-provider.test/v1"\n' > "$SBX/.bashrc"
+printf 'export ANTHROPIC_AUTH_TOKEN="sk-someone-elses-key"\n' >> "$SBX/.bashrc"
 out="$(sbx_install 2>&1)"
 assert_contains "a foreign rc token is left alone" "sk-someone-elses-key" "$(cat "$SBX/.bashrc")"
 assert_contains "a foreign rc token is still reported" \
   "exports ANTHROPIC_*" "$out"
 
-# --no-rc must not touch the shell config at all, migration included.
-printf 'export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"\n' > "$SBX/.bashrc"
+# --no-rc must not touch the shell config at all, repair included.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/.bashrc"
+printf 'export ANTHROPIC_AUTH_TOKEN="legacy-unissued-token"\n' >> "$SBX/.bashrc"
 out="$(sbx_install --no-rc 2>&1)"
-assert_contains "--no-rc keeps the tj_ token" "tj_legacy-token" "$(cat "$SBX/.bashrc")"
+assert_contains "--no-rc keeps the stale key" "legacy-unissued-token" "$(cat "$SBX/.bashrc")"
 assert_contains "--no-rc says why" "left alone (--no-rc)" "$out"
 
 # Restore the shipped profile for the wrapper tests below.
