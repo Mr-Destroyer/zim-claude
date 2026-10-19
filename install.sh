@@ -29,6 +29,7 @@ CONFIG_FILE="$HOME/litellm-config.yaml"
 STATE_DIR="$HOME/.local/share/zim-claude"
 STATE_FILE="$STATE_DIR/installed.tsv"
 BACKUP_ROOT="$STATE_DIR/backups"
+UPDATE_CONF="$STATE_DIR/update.conf"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 # The proxy gets its OWN virtualenv, built here rather than pip-installed into
@@ -92,7 +93,11 @@ record_state() {
 
 recorded_hash() {
   [[ -f "$STATE_FILE" ]] || return 1
-  awk -F'\t' -v p="$1" '$1==p {print $2; found=1} END{exit !found}' "$STATE_FILE"
+  # The LAST matching line, not every match. record_state appends on each
+  # install, so a re-installed file has several rows; printing them all would
+  # make `want` a multi-line string that can never equal a single hash, and
+  # every later install would report the file as user-modified.
+  awk -F'\t' -v p="$1" '$1==p {h=$2; found=1} END{if (!found) exit 1; print h}' "$STATE_FILE"
 }
 
 file_is_ours() {
@@ -218,6 +223,51 @@ export ANTHROPIC_API_KEY=""
 EOF
   chmod 600 -- "$ENV_FILE"
   ok "wrote $ENV_FILE (mode 600)"
+}
+
+# --- auto-update -------------------------------------------------------------
+
+# Record where this checkout lives and which branch it tracks, so the wrapper's
+# background updater can fast-forward it. The updater reads this file; keeping
+# the values out of the installed scripts means one checkout can be moved or
+# re-cloned without editing anything.
+#
+# Auto-update is only enabled when the source really is a git checkout on a
+# named branch. An unpacked tarball has nothing to pull from, and enabling it
+# there would just log a failure once an hour.
+#
+# The file is rewritten on every install — unlike the credential profile, this
+# is bookkeeping, not user data.
+write_update_conf() {
+  local repo="" branch="" enabled=0
+
+  if git -C "$SRC_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    repo="$SRC_DIR"
+    branch="$(git -C "$SRC_DIR" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    [[ -n "$branch" ]] && enabled=1
+  fi
+
+  if (( enabled )); then
+    say "auto-update: tracking origin/$branch in $repo"
+  else
+    say "auto-update: disabled (source is not a git checkout on a branch)"
+  fi
+
+  run mkdir -p -- "$STATE_DIR"
+  run chmod 700 -- "$STATE_DIR"
+  if (( DRY_RUN )); then
+    printf '    would write %s (auto-update=%s, branch=%s)\n' \
+      "$UPDATE_CONF" "$enabled" "${branch:-none}"
+    return 0
+  fi
+
+  {
+    printf '# Written by zim-claude install.sh — read by zim-claude-update.sh.\n'
+    printf 'ZIM_CLAUDE_AUTO_UPDATE=%s\n' "$enabled"
+    printf 'ZIM_CLAUDE_REPO_DIR=%q\n' "$repo"
+    printf 'ZIM_CLAUDE_REPO_BRANCH=%q\n' "$branch"
+  } >"$UPDATE_CONF"
+  chmod 600 -- "$UPDATE_CONF"
 }
 
 # --- prerequisites: check, warn, ask -----------------------------------------
@@ -574,6 +624,14 @@ do_uninstall() {
   # 5. Never touch user data. The env file is a credential and
   #    ~/claude-source/ may also hold unrelated profiles, so both stay put.
   say "keeping $ENV_FILE (your credential — delete it yourself if you want)"
+
+  # 6. Auto-update bookkeeping. Removing it is the point: a later wrapper from
+  #    a fresh install must not inherit a stale checkout path.
+  if [[ -f "$UPDATE_CONF" ]]; then
+    say "removing $UPDATE_CONF"
+    run rm -f -- "$UPDATE_CONF"
+  fi
+
   (( DRY_RUN )) && return 0
   [[ -f "$STATE_FILE" ]] && rm -f -- "$STATE_FILE"
   ok "uninstalled."
@@ -596,8 +654,10 @@ check_prereqs
 say "installing files"
 install_file "$SRC_DIR/scripts/zim-claude"       "$BIN_DIR/zim-claude"       755
 install_file "$SRC_DIR/scripts/start-litellm.sh" "$BIN_DIR/start-litellm.sh" 755
+install_file "$SRC_DIR/scripts/zim-claude-update.sh" "$BIN_DIR/zim-claude-update.sh" 755
 install_file "$SRC_DIR/config/litellm-config.yaml" "$CONFIG_FILE"            644
 install_config_env
+write_update_conf
 
 ensure_path
 check_conflicts

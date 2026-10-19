@@ -142,10 +142,13 @@ directory to `PATH`.)
 | Path | Purpose |
 |---|---|
 | `~/.local/bin/zim-claude` | the command |
+| `~/.local/bin/zim-claude-update.sh` | background self-updater (also runnable by hand) |
 | `~/.local/bin/start-litellm.sh` | proxy manager: `start`/`stop`/`restart`/`status`/`logs` |
 | `~/claude-source/deepseek-claude` | the env profile (mode 600) |
 | `~/litellm-config.yaml` | LiteLLM proxy config |
 | `~/.local/share/zim-claude/venv/` | the proxy's private virtualenv (litellm + uvloop) |
+| `~/.local/share/zim-claude/update.conf` | which checkout and branch the updater tracks |
+| `~/.local/share/zim-claude/update.log` | what the updater did, last few hundred KB |
 | `~/.local/share/zim-claude/` | install state + backups (mode 700) |
 
 Anything it would overwrite is backed up first, under
@@ -180,6 +183,44 @@ in place.
 starting with `tj_`). Those keys are useless against Logfare, so the installer backs the
 file up and replaces it with the shipped Logfare token; any other credential is left
 alone.
+
+### Auto-update
+
+`zim-claude` keeps itself current. Each time it starts, it launches
+`zim-claude-update.sh` **in the background** and then hands off to `claude` immediately —
+the updater can never delay, block or fail a session. It costs a fork, and the health
+check is unaffected.
+
+The updater is deliberately conservative:
+
+| Rule | Why |
+|---|---|
+| At most once an hour | a fetch on every invocation would be noise |
+| Locked | two sessions starting at once cannot update together |
+| Clean checkout only | a dirty tree is reported and skipped, never stashed |
+| Fast-forward only | never `reset`, `force` or merge; a diverged branch is left alone |
+| `--no-venv --no-rc` | no surprise downloads, no rewriting your shell config |
+| Never restarts the proxy | a running session keeps its proxy and config |
+
+It only works from a git checkout on a named branch — an unpacked tarball has nothing to
+pull from, and the installer records `auto-update: disabled` in that case. Point it at a
+different checkout by re-running `./install.sh` from that checkout.
+
+```bash
+zim-claude-update.sh          # update now, ignoring the interval
+```
+
+Configure or disable it with environment variables:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
+| `ZIM_CLAUDE_UPDATE_INTERVAL` | `3600` | seconds between checks (`0` = every run) |
+| `ZIM_CLAUDE_UPDATE_FORCE` | `0` | set to `1` to ignore the interval |
+| `ZIM_CLAUDE_UPDATE_TIMEOUT` | `20` | seconds allowed for `git fetch` |
+
+The log is at `~/.local/share/zim-claude/update.log` (rotated at 256 KB). Every outcome —
+updated, already current, dirty, diverged, fetch failed — is a line there.
 
 ---
 
@@ -251,6 +292,13 @@ machine's policy is untouched. Every `.ps1` here has such a shim for the same re
 
 You normally never need these — `zim-claude` health-checks `localhost:4000` and starts
 the CLI proxy if it's down, exactly as on Linux.
+
+Windows gets the same auto-update as Linux: `zim-claude` starts
+`zim-claude-update.ps1` in a hidden background process and hands off immediately. It
+reads `%USERPROFILE%\.local\share\zim-claude\update.json`, writes its log to
+`...\update.log`, and runs `win-install.bat -NoStart` after a fast-forward. Run
+`zim-claude-update` (the `.cmd` shim) to update by hand, or set `ZIM_CLAUDE_NO_UPDATE=1`
+to disable it.
 
 ### Windows requirements
 
@@ -420,6 +468,7 @@ through environment variables:
 | `ZIM_CLAUDE_BIN` | `claude` on `PATH` | which claude to run |
 | `ZIM_CLAUDE_NO_PROXY` | `0` | set to `1` to never touch the proxy |
 | `ZIM_CLAUDE_REQUIRE_PROXY` | `0` | set to `1` to hard-fail if the proxy is down |
+| `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
 
 Using a different profile:
 

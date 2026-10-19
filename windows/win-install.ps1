@@ -104,6 +104,8 @@ $BackupDir  = Join-Path $BackupRoot $Stamp
 $DeskConfigDir = Join-Path $StateDir 'desktop'
 $DeskConfig    = Join-Path $DeskConfigDir 'litellm-config.desktop.yaml'
 
+$UpdateConf    = Join-Path $StateDir 'update.json'
+
 # Values printed for the Claude Desktop dialog. The desktop proxy config reads
 # the same env var the CLI config does, so one profile serves both and the
 # shared secret stays in exactly one place.
@@ -323,6 +325,52 @@ function Install-DesktopConfig {
   return $true
 }
 
+# --- auto-update -------------------------------------------------------------
+
+# Record where this checkout lives and which branch it tracks, so the wrapper's
+# background updater can fast-forward it. Auto-update is only enabled when the
+# source really is a git checkout on a named branch; an unpacked archive has
+# nothing to pull from.
+#
+# Rewritten on every install - unlike the credential profile, this is
+# bookkeeping, not user data.
+function Write-UpdateConf {
+  $repo = ''
+  $branch = ''
+  $enabled = $false
+
+  if (Test-Path -LiteralPath (Join-Path $SrcDir '.git')) {
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+      $repo = $SrcDir
+      $branch = (& git -C $SrcDir symbolic-ref --quiet --short HEAD 2>$null)
+      if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrEmpty($branch)) {
+        $enabled = $true
+      } else {
+        $branch = ''
+      }
+    }
+  }
+
+  if ($enabled) {
+    Write-Say "auto-update: tracking origin/$branch in $repo"
+  } else {
+    Write-Say "auto-update: disabled (source is not a git checkout on a branch)"
+  }
+
+  Invoke-Step "mkdir $StateDir" { New-Item -ItemType Directory -Force -Path $StateDir | Out-Null }
+  if ($DryRun) {
+    Write-Host "    would write $UpdateConf (auto-update=$enabled, branch=$branch)"
+    return
+  }
+
+  $obj = [pscustomobject]@{
+    autoUpdate = $enabled
+    repoDir    = $repo
+    branch     = $branch
+  }
+  $obj | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $UpdateConf -Encoding UTF8
+}
+
 # --- prerequisites -----------------------------------------------------------
 
 function Get-PythonCmd {
@@ -538,6 +586,13 @@ function Invoke-Uninstall {
   # also hold unrelated profiles, so both stay put.
   Write-Say "keeping $EnvFile (your credential - delete it yourself if you want)"
 
+  # Auto-update bookkeeping goes: a later wrapper from a fresh install must not
+  # inherit a stale checkout path.
+  if (Test-Path -LiteralPath $UpdateConf) {
+    Write-Say "removing $UpdateConf"
+    Invoke-Step "remove $UpdateConf" { Remove-Item -LiteralPath $UpdateConf -Force }
+  }
+
   Invoke-Step "remove $StateFile" { Remove-Item -LiteralPath $StateFile -Force -ErrorAction SilentlyContinue }
   Write-Ok "uninstalled."
 }
@@ -574,7 +629,10 @@ if (-not $SkipCli) {
   Write-Say "installing the CLI side (:4000)"
   Install-File -Src (Join-Path $WinDir 'zim-claude.cmd')    -Dest (Join-Path $BinDir 'zim-claude.cmd')    -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude.ps1')    -Dest (Join-Path $BinDir 'zim-claude.ps1')    -Scope 'cli' | Out-Null
+  Install-File -Src (Join-Path $WinDir 'zim-claude-update.ps1') -Dest (Join-Path $BinDir 'zim-claude-update.ps1') -Scope 'cli' | Out-Null
+  Install-File -Src (Join-Path $WinDir 'zim-claude-update.cmd') -Dest (Join-Path $BinDir 'zim-claude-update.cmd') -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $SrcDir 'config\litellm-config.yaml') -Dest $CliConfig -Scope 'cli' | Out-Null
+  Write-UpdateConf
 }
 
 # Shared by both sides: one manager drives both proxies, and both read the same

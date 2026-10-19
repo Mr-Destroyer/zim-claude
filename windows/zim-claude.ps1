@@ -14,6 +14,7 @@
     ZIM_CLAUDE_BIN              claude executable  (default: claude on PATH)
     ZIM_CLAUDE_NO_PROXY=1       never touch the proxy
     ZIM_CLAUDE_REQUIRE_PROXY=1  hard-fail if the proxy is not healthy
+    ZIM_CLAUDE_NO_UPDATE=1      never auto-update
 
 .NOTES
   Invoke it through the zim-claude.cmd shim, which is what lands on PATH. The
@@ -163,6 +164,27 @@ Ensure-Proxy | Out-Null
 
 if ($RequireProxy -eq '1' -and -not (Test-ProxyHealthy)) {
   Write-Die "proxy is not healthy on :$Port and ZIM_CLAUDE_REQUIRE_PROXY=1."
+}
+
+# --- self-update -------------------------------------------------------------
+
+# Bring the installed package up to date in the background. Detached so it can
+# never delay, block or fail this session; the updater rate-limits itself,
+# refuses a dirty checkout, and only fast-forwards.
+$noUpdate = $env:ZIM_CLAUDE_NO_UPDATE
+if ($noUpdate -ne '1') {
+  $updater = Join-Path $SelfDir 'zim-claude-update.ps1'
+  if (Test-Path -LiteralPath $updater) {
+    try {
+      # Hidden window, no wait: the session must not depend on its outcome.
+      Start-Process -FilePath 'powershell' `
+                    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $updater) `
+                    -WindowStyle Hidden | Out-Null
+    } catch {
+      # An updater that cannot start is not the user's problem; the session
+      # is already healthy by this point.
+    }
+  }
 }
 
 # --- hand off ----------------------------------------------------------------

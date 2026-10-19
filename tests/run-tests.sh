@@ -131,10 +131,19 @@ section "windows artifacts"
 # right targets: a .bat wired to a renamed .ps1 is a silent, total failure that
 # no amount of review would catch, and it is exactly what a rename would break.
 for f in win-install.bat win-install.ps1 zim-claude.cmd zim-claude.ps1 \
-         start-proxies.ps1 verify.ps1; do
+         start-proxies.ps1 verify.ps1 zim-claude-update.ps1; do
   if [[ -f "$REPO/windows/$f" ]]; then pass "windows/$f present"
   else fail "windows/$f present"; fi
 done
+
+# The Linux updater must ship and be executable: the wrapper only launches it
+# when it is, so a non-executable copy would silently disable auto-update.
+if [[ -x "$REPO/scripts/zim-claude-update.sh" ]]; then
+  pass "scripts/zim-claude-update.sh is executable"
+else
+  fail "scripts/zim-claude-update.sh is not executable" \
+       "the wrapper would skip it and auto-update would never run"
+fi
 
 # win-install.bat must invoke win-install.ps1.
 if grep -q 'win-install\.ps1' "$REPO/windows/win-install.bat" 2>/dev/null; then
@@ -350,6 +359,18 @@ n="$(sbx_install --dry-run 2>&1 | grep -c 'would: install')"
 assert_eq "dry-run after install performs 0 installs" "0" "$n"
 n="$(grep -c 'zim-claude' "$SBX/.bashrc")"
 assert_eq "bashrc marker not duplicated" "3" "$n"
+
+# record_state appends a row per install, so a file installed more than once
+# has duplicate rows. recorded_hash must use the newest, or every later run
+# reports the file as user-modified and stops updating it.
+sbx_install --force >/dev/null 2>&1
+out="$(sbx_install 2>&1)"
+if [[ "$out" == *"you have modified this file"* ]]; then
+  fail "repeated installs keep recognising their own files" \
+       "the state file's duplicate rows broke the hash comparison"
+else
+  pass "repeated installs keep recognising their own files"
+fi
 
 section "secret is never clobbered"
 
@@ -654,6 +675,141 @@ env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb \
   && pass "uninstall keeps a venv it did not build" \
   || fail "uninstall keeps a venv it did not build"
 rm -rf "$VENV_SBX"
+
+# ------------------------------------------------------- auto-update ------
+
+section "auto-update"
+
+# A throwaway origin and clone. The updater only ever talks to whatever
+# `origin` the checkout has, so a local bare repo exercises every path -
+# fast-forward, up to date, dirty, diverged - without network access.
+if ! command -v git >/dev/null 2>&1; then
+  skip "git not installed - cannot exercise the updater"
+else
+  UP_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-update-XXXXXX")"
+  ORIGIN="$UP_SBX/origin.git"
+  CLONE="$UP_SBX/clone"
+  STATE="$UP_SBX/state"
+
+  git init -q --bare "$ORIGIN"
+  git clone -q "$ORIGIN" "$CLONE" 2>/dev/null
+  git -C "$CLONE" config user.name "Test"
+  git -C "$CLONE" config user.email "test@example.invalid"
+  # Minimal checkout: the updater re-runs install.sh, so it must be present
+  # and must succeed without touching the network or the real $HOME.
+  cat > "$CLONE/install.sh" <<'EOF'
+#!/usr/bin/env bash
+printf 'installed %s\n' "$(cat "$(dirname "$0")/VERSION")" >> "${UPDATE_MARK:?}"
+EOF
+  chmod +x "$CLONE/install.sh"
+  printf 'v1\n' > "$CLONE/VERSION"
+  git -C "$CLONE" add -A
+  git -C "$CLONE" commit -qm v1
+  branch="$(git -C "$CLONE" symbolic-ref --short HEAD)"
+  git -C "$CLONE" push -q origin "$branch"
+
+  mkdir -p "$STATE"
+  printf 'ZIM_CLAUDE_AUTO_UPDATE=1\nZIM_CLAUDE_REPO_DIR=%q\nZIM_CLAUDE_REPO_BRANCH=%q\n' \
+    "$CLONE" "$branch" > "$STATE/update.conf"
+
+  up() {
+    env -i HOME="$UP_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+      UPDATE_MARK="$STATE/mark" \
+      ZIM_CLAUDE_STATE_DIR="$STATE" ZIM_CLAUDE_UPDATE_CONF="$STATE/update.conf" \
+      ZIM_CLAUDE_UPDATE_LOG="$STATE/update.log" \
+      ZIM_CLAUDE_UPDATE_INTERVAL=0 \
+      bash "$REPO/scripts/zim-claude-update.sh" "$@"
+  }
+
+  # 1. up to date: nothing is installed, but it still succeeds.
+  up
+  assert_eq "updater exits 0 when up to date" "0" "$?"
+  assert_contains "updater reports up to date" "already up to date" \
+    "$(cat "$STATE/update.log" 2>/dev/null)"
+
+  # 2. a new upstream commit is fast-forwarded and installed.
+  git -C "$CLONE" pull -q origin "$branch"
+  printf 'v2\n' > "$CLONE/VERSION"
+  git -C "$CLONE" commit -qam v2
+  git -C "$CLONE" push -q origin "$branch"
+  # Put the clone back one commit, so the updater has work to do.
+  git -C "$CLONE" reset -q --hard HEAD~1
+  up
+  assert_contains "updater fast-forwards" "updated " "$(cat "$STATE/update.log")"
+  assert_eq "fast-forward reaches the new commit" "v2" "$(cat "$CLONE/VERSION")"
+  assert_contains "installer ran after the update" "installed v2" \
+    "$(cat "$STATE/mark" 2>/dev/null)"
+
+  # 3. a dirty checkout is left alone.
+  printf 'local edit\n' >> "$CLONE/VERSION"
+  before="$(git -C "$CLONE" rev-parse HEAD)"
+  git -C "$CLONE" pull -q origin "$branch" >/dev/null 2>&1 || true
+  up
+  assert_contains "dirty checkout is not updated" "has local changes" \
+    "$(cat "$STATE/update.log")"
+  assert_eq "dirty checkout keeps its HEAD" "$before" "$(git -C "$CLONE" rev-parse HEAD)"
+  git -C "$CLONE" checkout -q -- VERSION
+
+  # 4. a diverged branch (local commit) is not merged or reset.
+  printf 'local\n' > "$CLONE/LOCAL"
+  git -C "$CLONE" add -A
+  git -C "$CLONE" commit -qm local-only
+  # Advance origin separately.
+  other="$UP_SBX/other"
+  git clone -q "$ORIGIN" "$other" 2>/dev/null
+  git -C "$other" config user.name "Test"
+  git -C "$other" config user.email "test@example.invalid"
+  printf 'v3\n' > "$other/VERSION"
+  git -C "$other" commit -qam v3
+  git -C "$other" push -q origin "$branch"
+  before="$(git -C "$CLONE" rev-parse HEAD)"
+  up
+  assert_contains "diverged checkout is left alone" "has diverged" \
+    "$(cat "$STATE/update.log")"
+  assert_eq "diverged checkout keeps its local commit" "$before" \
+    "$(git -C "$CLONE" rev-parse HEAD)"
+
+  # 5. the rate limit: a second run inside the interval does nothing.
+  rm -f "$STATE/last-update-check"
+  up
+  n1="$(wc -l < "$STATE/update.log")"
+  env -i HOME="$UP_SBX" PATH="/usr/bin:/bin" TERM=dumb \
+    UPDATE_MARK="$STATE/mark" \
+    ZIM_CLAUDE_STATE_DIR="$STATE" ZIM_CLAUDE_UPDATE_CONF="$STATE/update.conf" \
+    ZIM_CLAUDE_UPDATE_LOG="$STATE/update.log" \
+    bash "$REPO/scripts/zim-claude-update.sh"
+  n2="$(wc -l < "$STATE/update.log")"
+  assert_eq "second run inside the interval logs nothing" "$n1" "$n2"
+
+  # 6. opt-out and unconfigured installs are silent no-ops.
+  : > "$STATE/update.log"
+  printf 'ZIM_CLAUDE_AUTO_UPDATE=0\n' > "$STATE/update.conf"
+  up
+  assert_eq "auto-update=0 is a no-op" "0" "$(wc -l < "$STATE/update.log")"
+  rm -f "$STATE/update.conf"
+  up
+  assert_contains "missing config is reported, not crashed on" "not configured" \
+    "$(cat "$STATE/update.log")"
+
+  rm -rf "$UP_SBX"
+fi
+
+# The wrapper must not run the updater when told not to, and must not fail when
+# the updater is absent.
+section "auto-update wiring"
+
+if grep -q 'ZIM_CLAUDE_NO_UPDATE' "$REPO/scripts/zim-claude"; then
+  pass "wrapper honours ZIM_CLAUDE_NO_UPDATE"
+else fail "wrapper ignores ZIM_CLAUDE_NO_UPDATE"; fi
+if grep -q 'zim-claude-update.sh' "$REPO/install.sh"; then
+  pass "installer ships the updater"
+else fail "installer does not ship the updater"; fi
+if grep -q 'write_update_conf' "$REPO/install.sh"; then
+  pass "installer records the checkout"
+else fail "installer does not record the checkout"; fi
+if grep -q 'zim-claude-update.ps1' "$REPO/windows/zim-claude.ps1"; then
+  pass "windows wrapper references the updater"
+else fail "windows wrapper does not reference the updater"; fi
 
 # ---------------------------------------------------------------- summary ---
 
