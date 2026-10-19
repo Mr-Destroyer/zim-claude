@@ -6,7 +6,7 @@
 #   LiteLLM :4002   (this config, started by start-desktop-proxy.sh)
 #        |  OpenAI-style
 #        v
-#   Token Juice  ->  DeepSeek-V4.1-Flash
+#   Logfare  ->  DeepSeek-V4.1-Flash
 #
 # Claude Desktop imposes two hard requirements on the gateway:
 #
@@ -14,42 +14,44 @@
 #      (contain "claude" or "anthropic"). Anything else is dropped
 #      from the picker with:
 #        inferenceModels: "X" is not an Anthropic model and was removed...
-#      That is why DeepSeek is exposed under claude-* names below.
+#      That is why the upstream models are exposed under claude-* names below.
 #
 #   2. drop_params: true — Cowork/Code sessions send Anthropic-only
 #      fields (cache_control, tool_reference, experimental beta
 #      headers) that a non-Anthropic upstream rejects with HTTP 400.
 #
 # The api_key is read from the environment; start-desktop-proxy.sh sources
-# ~/claude-source/deepseek-claude so ANTHROPIC_AUTH_TOKEN holds your
-# Token Juice key (same secret the zim-claude CLI proxy uses).
+# the profile (default ~/claude-source/deepseek-claude) so ANTHROPIC_AUTH_TOKEN
+# holds your Logfare key (same secret the zim-claude CLI proxy uses).
 
 model_list:
   # DeepSeek-V4.1-Flash behind an Opus-shaped name so the Desktop picker
   # accepts it and shows it as an Opus-tier model.
   - model_name: claude-opus-5-5
     litellm_params:
-      model: openai/deepseek-ai/DeepSeek-V4.1-Flash
-      api_base: https://api.tokenjuice.ai/v1
+      model: openai/deepseek-v4.1-flash
+      api_base: https://logfare.ai/v1
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
       drop_params: true
 
   # --- Optional extra tiers -------------------------------------------------
-  # Uncomment any of these to expose the SAME DeepSeek upstream under more
-  # picker entries. Handy if a Cowork/Code background task asks for a
-  # Sonnet- or Haiku-tier model by name.
+  # Uncomment any of these to expose more Logfare models under picker entries.
+  # Handy if a Cowork/Code background task asks for a Sonnet- or Haiku-tier
+  # model by name. Logfare retires models without notice; check the live
+  # catalog before relying on one:
+  #   curl -s 'https://logfare.ai/v1/status?hours=24'
   #
   # - model_name: claude-sonnet-4-5
   #   litellm_params:
-  #     model: openai/deepseek-ai/DeepSeek-V4.1-Flash
-  #     api_base: https://api.tokenjuice.ai/v1
+  #     model: openai/qwen-3.8-27b
+  #     api_base: https://logfare.ai/v1
   #     api_key: os.environ/ANTHROPIC_AUTH_TOKEN
   #     drop_params: true
   #
   # - model_name: claude-haiku-4-5
   #   litellm_params:
-  #     model: openai/deepseek-ai/DeepSeek-V4.1-Flash
-  #     api_base: https://api.tokenjuice.ai/v1
+  #     model: openai/claude-haiku-5-5
+  #     api_base: https://logfare.ai/v1
   #     api_key: os.environ/ANTHROPIC_AUTH_TOKEN
   #     drop_params: true
 
