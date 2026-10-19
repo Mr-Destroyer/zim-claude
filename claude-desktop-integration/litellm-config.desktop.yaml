@@ -34,6 +34,16 @@ model_list:
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
       drop_params: true
 
+  # The fallback target. It is a real model_name (not just a bare upstream
+  # name) because LiteLLM resolves fallbacks through model_list; naming it here
+  # is what lets router_settings below point at it.
+  - model_name: gemma-4-26b
+    litellm_params:
+      model: openai/gemma-4-26b
+      api_base: https://logfare.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+      drop_params: true
+
   # --- Optional extra tiers -------------------------------------------------
   # Uncomment any of these to expose more Logfare models under picker entries.
   # Handy if a Cowork/Code background task asks for a Sonnet- or Haiku-tier
@@ -58,6 +68,15 @@ model_list:
 litellm_settings:
   # Belt-and-braces: strip unsupported params globally too.
   drop_params: true
+
+router_settings:
+  # Same account budget as the CLI proxy, so the same 429 applies here: Logfare
+  # meters per account, and a spent budget makes every model a dead end until
+  # it resets. gemma-4-26b has kept answering through a spent budget and calls
+  # tools correctly, so it stands in for whatever the picker asked for.
+  # num_retries: 0 stops a retry from burning the same 429 again first.
+  num_retries: 0
+  default_fallbacks: ["gemma-4-26b"]
 
 general_settings:
   # Value Claude Desktop sends as "Gateway API key".

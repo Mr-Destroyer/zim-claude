@@ -137,3 +137,21 @@ model_list:
       model: openai/deepseek-v4.1-flash
       api_base: https://logfare.ai/v1
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+router_settings:
+  # Logfare meters a request budget per account, not per model, and answers a
+  # spent budget with 429 "Your account has reached its request budget" — which
+  # Claude Code surfaces as a rate-limit error on whatever model it asked for.
+  # Without a fallback that turns every session into a dead end until the
+  # budget resets (the 429 carries retry-after in the hours).
+  #
+  # gemma-4-26b is the one model that has kept answering through a spent
+  # budget, and it calls tools correctly, so it is the stand-in for every
+  # model: default_fallbacks covers the named entries, the `*` wildcard and the
+  # haiku aliases in one line. A model that has budget of its own is still used
+  # first; this only runs when it does not.
+  #
+  # num_retries: 0 matters. A retry against a model whose budget is spent just
+  # burns the same 429 again before the fallback is reached.
+  num_retries: 0
+  default_fallbacks: ["gemma-4-26b"]
