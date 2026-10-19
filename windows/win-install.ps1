@@ -6,7 +6,7 @@
   One installer for both sides, because on Windows they are always wanted
   together:
 
-    CLI      :4000   Claude Code CLI         (the zim-claude command)
+    CLI      :4001   Claude Code CLI         (the zim-claude command)
     Desktop  :4002   Claude Desktop gateway  (Third-Party Inference)
 
   It mirrors the behaviour of the two bash installers (install.sh at the repo
@@ -18,7 +18,7 @@
   Run windows\win-install.bat, which shims to this file.
 
 .PARAMETER SkipCli
-  Do not install the CLI side (:4000).
+  Do not install the CLI side (the CLI proxy).
 
 .PARAMETER SkipDesktop
   Do not install the Claude Desktop side (:4002).
@@ -114,7 +114,7 @@ $UpdateConf    = Join-Path $StateDir 'update.json'
 # (so it does not warn about values it just wrote) and by the shell-profile
 # migration. Set by Install-EnvProfile.
 $script:EffectiveToken = ''
-$script:EffectivePort  = 4000
+$script:EffectivePort  = 4001
 
 # Values printed for the Claude Desktop dialog. The desktop proxy config reads
 # the same env var the CLI config does, so one profile serves both and the
@@ -225,9 +225,9 @@ function Install-File {
 # Mirrors install.sh. The profile points claude at a local proxy, and a proxy
 # that rejects the profile's token looks exactly like a broken install: every
 # request answers "No connected db." Another LiteLLM (ZimZilla's, a leftover
-# install) holding :4000 is the usual cause.
+# install) holding the default port is the usual cause.
 
-$PortCandidates = @(4000, 4001, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010)
+$PortCandidates = @(4001, 4000, 4003, 4004, 4005, 4006, 4007, 4008, 4009, 4010)
 
 # Something is listening on the port. A connection error is the "free" signal.
 function Test-PortOpen {
@@ -258,7 +258,7 @@ function Test-ProxyAcceptsToken {
 function Get-PortFromUrl {
   param([string]$Url)
   if ($Url -match ':([0-9]+)') { return [int]$Matches[1] }
-  return 4000
+  return 4001
 }
 
 # Returns the port to write into the profile.
@@ -297,8 +297,8 @@ function Select-ProxyPort {
   }
 
   Write-Warn "every candidate port is busy and none accepts the token."
-  Write-Warn "  falling back to :4000 - pass -Port N to choose another."
-  return 4000
+  Write-Warn "  falling back to :4001 - pass -Port N to choose another."
+  return 4001
 }
 
 function Install-EnvProfile {
@@ -805,7 +805,7 @@ if ($DryRun) { Write-Warn "DRY RUN - nothing will be changed" }
 Test-Prereqs
 
 if (-not $SkipCli) {
-  Write-Say "installing the CLI side (:4000)"
+  Write-Say "installing the CLI side (port auto-detected)"
   Install-File -Src (Join-Path $WinDir 'zim-claude.cmd')    -Dest (Join-Path $BinDir 'zim-claude.cmd')    -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude.ps1')    -Dest (Join-Path $BinDir 'zim-claude.ps1')    -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude-update.ps1') -Dest (Join-Path $BinDir 'zim-claude-update.ps1') -Scope 'cli' | Out-Null

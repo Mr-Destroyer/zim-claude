@@ -23,11 +23,11 @@ _self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pw
 
 LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
 # Kept separate so "not set" can mean "follow the profile". The installer picks
-# a port by probing and records it in ANTHROPIC_BASE_URL; hardcoding 4000 here
+# a port by probing and records it in ANTHROPIC_BASE_URL; hardcoding one here
 # would make the wrapper check, and try to start, a proxy the profile does not
-# use — and on a machine where another proxy owns :4000, warn on every run.
+# use — and on a machine where another proxy owns that port, warn on every run.
 _zim_port_explicit="${LITELLM_PORT:+1}"
-LITELLM_PORT="${LITELLM_PORT:-4000}"
+LITELLM_PORT="${LITELLM_PORT:-4001}"
 LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
 LITELLM_SERVICE="${LITELLM_SERVICE:-$_self_dir/start-litellm.sh}"
 

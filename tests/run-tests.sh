@@ -370,7 +370,7 @@ assert_eq "claude-source dir mode 700" "700" "$(stat -c%a "$SBX/claude-source" 2
 assert_eq "wrapper mode 755" "755" "$(stat -c%a "$SBX/.local/bin/zim-claude" 2>/dev/null)"
 assert_eq "state dir mode 700" "700" "$(stat -c%a "$SBX/.local/share/zim-claude" 2>/dev/null)"
 
-assert_contains "env file has base url" 'ANTHROPIC_BASE_URL="http://localhost:4000"' \
+assert_contains "env file has base url" 'ANTHROPIC_BASE_URL="http://localhost:4001"' \
   "$(cat "$SBX/claude-source/deepseek-claude")"
 assert_contains "env file clears ANTHROPIC_API_KEY" 'ANTHROPIC_API_KEY=""' \
   "$(cat "$SBX/claude-source/deepseek-claude")"
@@ -579,7 +579,7 @@ assert_contains "  ...subcommand forwarded" "[1]=<mcp>" "$out"
 section "environment handling"
 
 out="$(run_stub --version)"
-assert_contains "profile base url reaches claude" "BASE_URL=http://localhost:4000" "$out"
+assert_contains "profile base url reaches claude" "BASE_URL=http://localhost:4001" "$out"
 assert_contains "profile model reaches claude" "MODEL=deepseek-v4.1-flash" "$out"
 assert_contains "auth token exported" "TOKEN_SET=yes" "$out"
 assert_contains "ANTHROPIC_API_KEY is empty" "APIKEY=<>" "$out"
@@ -588,7 +588,7 @@ assert_contains "ANTHROPIC_API_KEY is empty" "APIKEY=<>" "$out"
 out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
   ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>/dev/null)"
-assert_contains "inherited base url is overridden" "BASE_URL=http://localhost:4000" "$out"
+assert_contains "inherited base url is overridden" "BASE_URL=http://localhost:4001" "$out"
 
 err="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \

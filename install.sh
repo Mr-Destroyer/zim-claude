@@ -47,11 +47,14 @@ ENVD_CONF="$ENVD_DIR/zim-claude.conf"
 MARKER_BEGIN="# >>> zim-claude >>>"
 MARKER_END="# <<< zim-claude <<<"
 
-# Ports probed when choosing where the CLI proxy should live. 4002 is
-# deliberately absent: that is the Claude Desktop gateway, and pointing the CLI
-# at it would replace the desktop app's route. Overridable so a test (or a
-# machine with an unusual range) can use different ports.
-PORT_CANDIDATES="${ZIM_CLAUDE_PORT_CANDIDATES:-4000 4001 4003 4004 4005 4006 4007 4008 4009 4010}"
+# Where the CLI proxy lives by default. 4001 is the Logfare/ZimZilla port; the
+# probe below still moves away from it if something else owns it.
+# 4002 is deliberately absent from the candidate list: that is the Claude
+# Desktop gateway, and pointing the CLI at it would replace the desktop app's
+# route. Overridable so a test (or a machine with an unusual range) can use
+# different ports.
+PROXY_PORT_DEFAULT="${ZIM_CLAUDE_DEFAULT_PORT:-4001}"
+PORT_CANDIDATES="${ZIM_CLAUDE_PORT_CANDIDATES:-4001 4000 4003 4004 4005 4006 4007 4008 4009 4010}"
 
 # The model name written into profiles. Must exist in config/litellm-config.yaml
 # and in the live catalog: a name Logfare has retired fails as a 404 that looks
@@ -172,10 +175,10 @@ install_file() {   # install_file <src> <dest> <mode>
 # --- choosing a proxy port ---------------------------------------------------
 #
 # The profile points claude at a local proxy, and the proxy is only useful if it
-# accepts the profile's token. Two things make a hardcoded :4000 wrong:
+# accepts the profile's token. Two things make a fixed default wrong:
 #
-#   - another LiteLLM (ZimZilla's, a leftover install) already holds :4000 and
-#     rejects the token, answering every request with "No connected db."
+#   - another LiteLLM (ZimZilla's, a leftover install) already holds the port
+#     and rejects the token, answering every request with "No connected db."
 #   - that other proxy is fine, but it is on a different port.
 #
 # So the installer probes: it keeps a port that already accepts the token, keeps
@@ -203,12 +206,13 @@ proxy_accepts_token() {
   [[ "$code" == "200" ]]
 }
 
-# port_from_url <url> — the port a base URL points at, 4000 if it names none.
+# port_from_url <url> — the port a base URL points at, the default if it names
+# none.
 port_from_url() {
   local url="$1" port
   port="${url##*:}"
   port="${port%%/*}"
-  if [[ "$port" =~ ^[0-9]+$ ]]; then printf '%s' "$port"; else printf '4000'; fi
+  if [[ "$port" =~ ^[0-9]+$ ]]; then printf '%s' "$port"; else printf '%s' "$PROXY_PORT_DEFAULT"; fi
 }
 
 # choose_proxy_port <token> [<current-url>] — sets PROXY_PORT_CHOSEN.
@@ -271,7 +275,7 @@ choose_proxy_port() {
 #     against Logfare (the proxy forwards them upstream and every request
 #     401s), so the install would look fine and fail on first use.
 #   - a Logfare profile whose base URL points at a port that rejects its own
-#     token. That is a real machine: another proxy holds :4000 and answers
+#     token. That is a real machine: another proxy holds the port and answers
 #     "No connected db." The token is fine, the port is not, so only the port
 #     is moved.
 #
@@ -635,7 +639,7 @@ ensure_proxy_venv() {
   if ! ask_consent "LiteLLM proxy virtualenv" \
        "install litellm + uvloop into $PROXY_VENV (downloads a few hundred MB)"; then
     warn "skipping the proxy virtualenv."
-    warn "  the CLI works, but the :4000 proxy has no litellm to run."
+    warn "  the CLI works, but the proxy on :$PROXY_PORT_DEFAULT has no litellm to run."
     warn "  build it later with:  ./install.sh"
     return 1
   fi

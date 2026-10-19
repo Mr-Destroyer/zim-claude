@@ -39,10 +39,10 @@ else { $EnvFile = Join-Path $env:USERPROFILE 'claude-source\deepseek-claude' }
 
 # The profile chooses the port. Only an explicit LITELLM_PORT overrides it:
 # the installer probes for a port whose proxy accepts this profile's token, so
-# a hardcoded 4000 here would check (and start) a proxy the profile does not
-# use, and warn on every run on a machine where another proxy owns :4000.
+# a hardcoded default here would check (and start) a proxy the profile does
+# not use, and warn on every run on a machine where another proxy owns that port.
 $portExplicit = -not [string]::IsNullOrEmpty($env:LITELLM_PORT)
-$Port = 4000
+$Port = 4001
 if ($portExplicit) { $Port = [int]$env:LITELLM_PORT }
 
 $Service = Join-Path $SelfDir 'start-proxies.ps1'

@@ -35,12 +35,12 @@ The proxy starts automatically the first time you use it, and the health check c
 about 8 ms once it is already up.
 
 ```
-  Claude Code  ──▶  LiteLLM :4000  ──▶  Logfare  ──▶  upstream
+  Claude Code  ──▶  LiteLLM :4001  ──▶  Logfare  ──▶  upstream
    zim-claude          (local)                        (model)
 ```
 
-The port is auto-detected at install time and recorded in the profile; `:4000` is the
-usual result. See [Which port it picks](#which-port-it-picks).
+The port is auto-detected at install time and recorded in the profile; `:4001` is the
+default. See [Which port it picks](#which-port-it-picks).
 
 ---
 
@@ -189,7 +189,7 @@ file up and replaces it with the shipped Logfare token; any other credential is 
 alone.
 
 It also repairs a profile that points at a port which **rejects its own token**. That
-happens when another LiteLLM — ZimZilla's, a leftover install — already owns `:4000`
+happens when another LiteLLM — ZimZilla's, a leftover install — already owns the port
 and answers every request with `No connected db.` The token is fine, the port is not,
 so the installer backs the profile up and moves only `ANTHROPIC_BASE_URL`.
 
@@ -204,8 +204,8 @@ The installer probes the local ports and writes the one that works into the prof
 | The profile's port is held by a proxy that rejects the token | move to a port that accepts it |
 | No proxy accepts the token anywhere | take the first free port |
 
-Candidates are `4000`, `4001`, then `4003`–`4010` (`4002` is the Claude Desktop
-gateway). Override the whole search with `--port N`.
+The default is `4001`. Candidates are tried in the order `4001`, `4000`, then `4003`–`4010`
+(`4002` is the Claude Desktop gateway). Override the whole search with `--port N`.
 
 The wrapper follows the profile's port, so a profile moved to `:4001` works with no
 environment variable set. `LITELLM_PORT` still wins when you set it explicitly.
@@ -270,7 +270,7 @@ together:
 
 | | CLI | Claude Desktop |
 |---|---|---|
-| Port | auto-detected (usually `4000`) | `4002` |
+| Port | auto-detected (default `4001`) | `4002` |
 | Config | `%USERPROFILE%\litellm-config.yaml` | `%USERPROFILE%\.local\share\zim-claude\desktop\litellm-config.desktop.yaml` |
 | Log | `%USERPROFILE%\.local\share\zim-claude\logs\cli.log` | `...\logs\desktop.log` |
 
@@ -364,7 +364,7 @@ and injects its own credentials. It only accepts a custom endpoint through
 **Third-Party Inference → Gateway**.
 
 So there is a second, independent proxy on `:4002` for it. Separate port, config, log and
-PID file — `zim-claude` on `:4000` keeps working untouched.
+PID file — the CLI proxy keeps working untouched.
 
 <div align="center">
 
@@ -417,7 +417,7 @@ cd claude-desktop-integration
 ```
 
 It starts the proxy and prints the exact values to paste into the app. It does **not**
-touch `:4000` or your shell config.
+touch the CLI proxy or your shell config.
 
 Then, in Claude Desktop:
 

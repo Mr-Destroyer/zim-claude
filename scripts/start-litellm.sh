@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # start-litellm.sh — run the LiteLLM translation proxy for Claude Code
 #
-#   Claude Code (Anthropic /v1/messages) --▶ LiteLLM :4000 --▶ Logfare (OpenAI)
+#   Claude Code (Anthropic /v1/messages) --▶ LiteLLM :4001 --▶ Logfare (OpenAI)
 #
 # Usage:  ./start-litellm.sh [start|stop|restart|status|logs|help]
 #
@@ -14,7 +14,7 @@ set -euo pipefail
 # --------------------------- configurable ---------------------------
 ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
 CONFIG="${LITELLM_CONFIG:-$HOME/litellm-config.yaml}"
-PORT="${LITELLM_PORT:-4000}"
+PORT="${LITELLM_PORT:-4001}"
 LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
 # Per-port, so the CLI proxy and the Claude Desktop gateway (or a second
 # zim-claude install) cannot mistake each other for their own process. A shared
