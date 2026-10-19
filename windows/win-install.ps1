@@ -211,11 +211,6 @@ function Install-File {
 function Install-EnvProfile {
   Invoke-Step "mkdir $HomeSrc" { New-Item -ItemType Directory -Force -Path $HomeSrc | Out-Null }
 
-  if (Test-Path -LiteralPath $EnvFile) {
-    Write-Say "keeping existing env file: $EnvFile (never overwritten)"
-    return $true
-  }
-
   # Plaintext token file. Trims surrounding whitespace, including the CR that a
   # Windows checkout or a browser copy-paste adds - a trailing CR inside the
   # export produces a 401 that looks like a bad key.
@@ -234,6 +229,38 @@ function Install-EnvProfile {
       $b64 = (Get-Content -LiteralPath $b64Path -Raw) -replace '\s', ''
       $token = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))) -replace '\s', ''
     } catch { $token = '' }
+  }
+
+  if (Test-Path -LiteralPath $EnvFile) {
+    # A legacy Token Juice profile (tj_ key) is useless against Logfare: the
+    # proxy forwards the key upstream and every request 401s, so the install
+    # would look fine and fail on first use. That one case is migrated, with a
+    # backup. Any other credential is the user's own and is left alone.
+    $current = ''
+    foreach ($line in Get-Content -LiteralPath $EnvFile -ErrorAction SilentlyContinue) {
+      if ($line -match '^export\s+ANTHROPIC_AUTH_TOKEN="(.*)"$') {
+        $current = $Matches[1]
+        break
+      }
+    }
+
+    if ($current -notlike 'tj_*') {
+      Write-Say "keeping existing env file: $EnvFile (never overwritten)"
+      return $true
+    }
+
+    if ([string]::IsNullOrEmpty($token)) {
+      Write-Err "existing env file has a Token Juice token, but $SrcDir\config\token is missing"
+      Write-Err "  cannot migrate it to Logfare - re-clone or restore config\token"
+      return $false
+    }
+    Backup-IfExists -Path $EnvFile
+    Write-Say "migrating env file from Token Juice to Logfare: $EnvFile"
+    if ($DryRun) {
+      Write-Host "    would rewrite 4 ANTHROPIC_* exports (token redacted)"
+      return $true
+    }
+    # Fall through to the writer below, which overwrites the file wholesale.
   }
 
   if ([string]::IsNullOrEmpty($token)) {

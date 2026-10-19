@@ -372,6 +372,34 @@ assert_contains "token survives --force" "sentinel-must-survive" \
 cp "$SBX/good-profile" "$SBX/claude-source/deepseek-claude"
 chmod 600 "$SBX/claude-source/deepseek-claude"
 
+section "Token Juice -> Logfare migration"
+
+# A profile carried over from the old upstream holds a tj_ key. Logfare
+# forwards it upstream and 401s every request, so leaving it alone would make
+# a successful install fail on first use. It is the one credential the
+# installer replaces - and it must take a backup first.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_AUTH_TOKEN="tj_legacy-token"\n' >> "$SBX/claude-source/deepseek-claude"
+printf 'export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"\n' >> "$SBX/claude-source/deepseek-claude"
+out="$(sbx_install 2>&1)"
+assert_contains "legacy tj_ profile is migrated" "migrating env file from Token Juice to Logfare" "$out"
+assert_contains "migrated profile carries the Logfare token" \
+  "lfu_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden" "$(cat "$SBX/claude-source/deepseek-claude")"
+assert_contains "migrated profile drops the stale model name" \
+  'ANTHROPIC_MODEL="deepseek-v4.1-flash"' "$(cat "$SBX/claude-source/deepseek-claude")"
+if grep -q 'tj_legacy-token\|Flash-1017' "$SBX/claude-source/deepseek-claude"; then
+  fail "migration leaves no Token Juice remnants" "old token or model survived"
+else pass "migration leaves no Token Juice remnants"; fi
+if compgen -G "$SBX/.local/share/zim-claude/backups/*/claude-source__deepseek-claude" >/dev/null; then
+  pass "migration backs up the old profile"
+else fail "migration backs up the old profile" "no backup of the tj_ profile found"; fi
+assert_eq "migrated profile is mode 600" "600" \
+  "$(stat -c%a "$SBX/claude-source/deepseek-claude" 2>/dev/null)"
+
+# Restore the shipped profile for the wrapper tests below.
+cp "$SBX/good-profile" "$SBX/claude-source/deepseek-claude"
+chmod 600 "$SBX/claude-source/deepseek-claude"
+
 # ---------------------------------------------------------------- wrapper ---
 
 section "argument pass-through"

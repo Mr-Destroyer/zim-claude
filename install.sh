@@ -140,21 +140,21 @@ install_file() {   # install_file <src> <dest> <mode>
 
 # The env file is special: it holds a live credential, so it is never
 # overwritten — not even with --force. Losing it would mean re-issuing a token.
+#
+# The one exception is a legacy Token Juice profile. Token Juice keys start
+# with `tj_` and are useless against Logfare (the proxy forwards them upstream
+# and every request 401s), so an install carried over from the old upstream
+# would look fine and fail on first use. That case is migrated, with a backup;
+# any other credential is the user's own and is left alone.
 install_config_env() {
   run mkdir -p -- "$HOME_SRC_DIR"
   run chmod 700 -- "$HOME_SRC_DIR"
 
-  if [[ -e "$ENV_FILE" ]]; then
-    say "keeping existing env file: $ENV_FILE (never overwritten)"
-    run chmod 600 -- "$ENV_FILE"
-    return 0
-  fi
-
+  local token="" src=""
   # Plaintext token file. Trims surrounding whitespace, including the CR that
   # a Windows checkout or a copy-paste through a browser adds — a trailing CR
   # would otherwise end up inside the export and break authentication with a
   # 401 that looks like a bad key.
-  local token="" src=""
   if [[ -f "$SRC_DIR/config/token" ]]; then
     src="$SRC_DIR/config/token"
     token="$(tr -d ' \t\r\n' < "$src" || true)"
@@ -162,6 +162,33 @@ install_config_env() {
     # Legacy layout: base64 blob. Kept so an existing checkout still installs.
     src="$SRC_DIR/config/.token.b64"
     token="$(base64 -d < "$src" 2>/dev/null | tr -d ' \t\r\n' || true)"
+  fi
+
+  if [[ -e "$ENV_FILE" ]]; then
+    local current=""
+    current="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$ENV_FILE" 2>/dev/null | head -1)"
+
+    if [[ "$current" != tj_* ]]; then
+      say "keeping existing env file: $ENV_FILE (never overwritten)"
+      run chmod 600 -- "$ENV_FILE"
+      return 0
+    fi
+
+    # A Token Juice credential. Replace it with the shipped Logfare token.
+    if [[ -z "$token" ]]; then
+      err "existing env file has a Token Juice token, but $SRC_DIR/config/token is missing"
+      err "  cannot migrate it to Logfare — re-clone or restore config/token"
+      return 1
+    fi
+    backup_if_exists "$ENV_FILE"
+    say "migrating env file from Token Juice to Logfare: $ENV_FILE"
+    if (( DRY_RUN )); then
+      printf '    would rewrite 4 ANTHROPIC_* exports (token redacted)\n'
+      return 0
+    fi
+    # Fall through to the writer below; it overwrites the file wholesale, so
+    # nothing from the Token Juice profile (including ANTHROPIC_MODEL) survives.
+    : >"$ENV_FILE"
   fi
 
   if [[ -z "$token" ]]; then
