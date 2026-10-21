@@ -7,24 +7,8 @@
 # pinned to LF.
 * text=auto eol=lf
 
-# cmd.exe's parser predates LF-only files and is unreliable with them
-# (notably around labels and `goto`). Let Git hand Windows the CRLF it expects.
-*.bat text eol=crlf
-*.cmd text eol=crlf
-
-# Windows PowerShell reads LF fine, and keeping these LF means they diff
-# cleanly against their bash counterparts. Marked explicitly so a checkout on
-# Windows with autocrlf=true cannot silently convert them either.
-*.ps1 text eol=lf
-
-# The credential is read verbatim and any injected CR would end up inside the
-# token, producing a 401 that looks like a bad key. install.sh already strips
-# whitespace defensively; this stops the byte from being added in the first
-# place. -text disables all conversion for this path.
-config/token -text
-
-# Screenshots are binary. Git already sniffs them and skips conversion, but
-# saying so explicitly keeps a future eol rule from ever mangling an image.
+# Binary files: Git already sniffs these and skips conversion, but saying so
+# explicitly keeps a future eol rule from ever mangling an image.
 *.png binary
 *.jpg binary
 *.jpeg binary

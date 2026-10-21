@@ -1,42 +1,51 @@
 #!/usr/bin/env bash
-# zim-claude — run Claude Code against the local LiteLLM -> Logfare route.
+# zim-claude — run Claude Code against TokenHarbor.
 #
 # Every argument is forwarded verbatim to `claude`. This script deliberately
 # parses NO options of its own: `zim-claude --help`, `zim-claude mcp list`,
 # `zim-claude -p "..."` and every other Claude Code flag/subcommand must reach
-# claude unchanged. Configure this script through environment variables only.
+# claude unchanged. Configure it through environment variables only.
 #
-#   LITELLM_ENV_FILE          profile to source   (default ~/claude-source/deepseek-claude)
-#   LITELLM_PORT              proxy port         (default: the port in the profile)
-#   LITELLM_LOG               proxy log path     (default /tmp/litellm-proxy.log)
-#   LITELLM_SERVICE           service manager    (default <dir>/start-litellm.sh)
-#   ZIM_CLAUDE_BIN            claude binary      (default: `claude` on PATH)
-#   ZIM_CLAUDE_NO_PROXY=1     never touch the proxy
-#   ZIM_CLAUDE_REQUIRE_PROXY=1  hard-fail if the proxy is not healthy
+# What a run does:
+#
+#   1. asks for a TokenHarbor API key (unless one is already in the environment)
+#   2. validates it against GET /v1/models
+#   3. lists the free models and lets the user pick one
+#   4. exports ANTHROPIC_* for this process only, then execs claude
+#
+# No proxy is involved. TokenHarbor serves the Anthropic Messages API natively
+# at /v1/messages, so Claude Code talks to it directly.
+#
+#   ZIM_CLAUDE_API_KEY        key to use; skips the prompt
+#                             (TOKENHARBOR_API_KEY is accepted too)
+#   ZIM_CLAUDE_MODEL          model id to use; skips the picker
+#   ZIM_CLAUDE_BASE_URL       API base URL  (default https://tokenharbor.ai)
+#   ZIM_CLAUDE_BIN            claude binary (default: `claude` on PATH)
+#   ZIM_CLAUDE_STATE_DIR      where the last pick is remembered
 #   ZIM_CLAUDE_NO_UPDATE=1    never auto-update
 
 set -euo pipefail
 
 # Self-locating, so a symlinked or relocated install still finds its sibling
-# start-litellm.sh.
-_self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
+# updater. Resolved without `readlink -f`: that flag is GNU-only and this
+# package claims macOS support.
+_zc_src="${BASH_SOURCE[0]}"
+while [[ -L "$_zc_src" ]]; do
+  _zc_dir="$(cd -P -- "$(dirname -- "$_zc_src")" && pwd)"
+  _zc_src="$(readlink -- "$_zc_src")"
+  [[ "$_zc_src" != /* ]] && _zc_src="$_zc_dir/$_zc_src"
+done
+_self_dir="$(cd -P -- "$(dirname -- "$_zc_src")" && pwd)"
 
-LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$HOME/claude-source/deepseek-claude}"
-# Kept separate so "not set" can mean "follow the profile". The installer picks
-# a port by probing and records it in ANTHROPIC_BASE_URL; hardcoding one here
-# would make the wrapper check, and try to start, a proxy the profile does not
-# use — and on a machine where another proxy owns that port, warn on every run.
-_zim_port_explicit="${LITELLM_PORT:+1}"
-LITELLM_PORT="${LITELLM_PORT:-4001}"
-LITELLM_LOG="${LITELLM_LOG:-/tmp/litellm-proxy.log}"
-LITELLM_SERVICE="${LITELLM_SERVICE:-$_self_dir/start-litellm.sh}"
+BASE_URL="${ZIM_CLAUDE_BASE_URL:-https://tokenharbor.ai}"
+BASE_URL="${BASE_URL%/}"
+STATE_DIR="${ZIM_CLAUDE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zim-claude}"
+LAST_MODEL_FILE="$STATE_DIR/last-model"
 
-ZIM_CLAUDE_NO_PROXY="${ZIM_CLAUDE_NO_PROXY:-0}"
-ZIM_CLAUDE_REQUIRE_PROXY="${ZIM_CLAUDE_REQUIRE_PROXY:-0}"
 CLAUDE_BIN="${ZIM_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
 
 # All diagnostics go to stderr: `zim-claude -p "x" --output-format json | jq`
-# must stay parseable.
+# must stay parseable, and the model menu must not pollute stdout either.
 die()  { printf '\033[31m[zim-claude]\033[0m %s\n' "$*" >&2; exit 2; }
 warn() { printf '\033[33m[zim-claude]\033[0m %s\n' "$*" >&2; }
 info() { printf '\033[36m[zim-claude]\033[0m %s\n' "$*" >&2; }
@@ -51,122 +60,282 @@ info() { printf '\033[36m[zim-claude]\033[0m %s\n' "$*" >&2; }
 [[ -x "$CLAUDE_BIN" ]] \
   || die "claude is not executable: $CLAUDE_BIN"
 
-# Fail CLOSED. Without the profile, claude would silently use whatever
-# ANTHROPIC_* the user's shell already exports — a session against the wrong
-# provider, with the wrong model, and no indication anything was off.
-[[ -r "$LITELLM_ENV_FILE" ]] \
-  || die "env file not found or unreadable: $LITELLM_ENV_FILE
-       Refusing to run: without it, claude would silently use whatever
-       ANTHROPIC_* variables your shell already exports.
-       Fix:  LITELLM_ENV_FILE=/path/to/profile zim-claude ...
-       or re-run install.sh."
+command -v curl >/dev/null 2>&1 \
+  || die "curl is required to reach $BASE_URL, and it is not on PATH."
 
-# --- load the profile --------------------------------------------------------
+# --- the terminal ------------------------------------------------------------
+#
+# Prompts go through /dev/tty rather than stdin, so `zim-claude -p x < file`
+# still asks for the key on the terminal the user is looking at. Opening it
+# also tells us whether there IS a terminal, which decides whether a missing
+# key is a prompt or a hard error.
 
-# Captured BEFORE `set -a`, so this bookkeeping var is not itself exported.
-_zim_prev_base_url="${ANTHROPIC_BASE_URL:-}"
-
-set -a
-# shellcheck disable=SC1090
-. "$LITELLM_ENV_FILE"
-set +a
-
-[[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] \
-  || die "$LITELLM_ENV_FILE did not set ANTHROPIC_AUTH_TOKEN — refusing to start."
-
-# Report the override rather than silently changing provider.
-if [[ -n "$_zim_prev_base_url" && "$_zim_prev_base_url" != "${ANTHROPIC_BASE_URL:-}" ]]; then
-  warn "overriding inherited ANTHROPIC_BASE_URL=$_zim_prev_base_url -> ${ANTHROPIC_BASE_URL:-}"
-fi
-
-# --- follow the profile's port -----------------------------------------------
-
-# The profile is the single source of truth for where the proxy lives. Only an
-# explicit LITELLM_PORT overrides it.
-if [[ -z "$_zim_port_explicit" && -n "${ANTHROPIC_BASE_URL:-}" ]]; then
-  _zim_url_port="${ANTHROPIC_BASE_URL##*:}"
-  _zim_url_port="${_zim_url_port%%/*}"
-  if [[ "$_zim_url_port" =~ ^[0-9]+$ ]]; then
-    LITELLM_PORT="$_zim_url_port"
-  fi
-fi
-
-# --- only manage a proxy when the profile points at the local one ------------
-
-case "${ANTHROPIC_BASE_URL:-}" in
-  *"localhost:${LITELLM_PORT}"*|*"127.0.0.1:${LITELLM_PORT}"*) ;;
-  *)
-    warn "ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-<unset>} is not the local proxy"
-    warn "on :${LITELLM_PORT}; skipping the proxy start-up check."
-    ZIM_CLAUDE_NO_PROXY=1
-    ;;
-esac
-
-port_answers() {
-  local code
-  code="$(curl -s -o /dev/null -w '%{http_code}' \
-      "http://127.0.0.1:${LITELLM_PORT}/health/liveliness" --max-time 2 || true)"
-  [[ "$code" == "200" ]]
-}
-
-ensure_proxy() {
-  [[ "$ZIM_CLAUDE_NO_PROXY" == "1" ]] && return 0
-  port_answers && return 0
-
-  if [[ ! -x "$LITELLM_SERVICE" ]]; then
-    warn "proxy not answering on :${LITELLM_PORT}, and no service manager at"
-    warn "$LITELLM_SERVICE. Start it yourself, or set ZIM_CLAUDE_NO_PROXY=1."
-    return 1
-  fi
-
-  info "LiteLLM proxy not answering on :${LITELLM_PORT} — starting it..."
-  # Invoke as a SUBPROCESS, never `source`: start-litellm.sh's trailing `case`
-  # runs on load, and its functions call `exit`. LITELLM_PORT is passed
-  # explicitly because the profile, not this script's default, chose the port.
-  if LITELLM_PORT="$LITELLM_PORT" "$LITELLM_SERVICE" start; then
-    info "proxy is up."
+_tty_open=0
+open_tty() {
+  (( _tty_open )) && return 0
+  if { exec 3</dev/tty; } 2>/dev/null; then
+    _tty_open=1
     return 0
   fi
-  warn "could not start the proxy — see $LITELLM_LOG"
-  warn "continuing anyway; claude will report the connection error."
   return 1
 }
 
-# Serialize cold starts. do_start() has a check-then-act window, so two racing
-# invocations would both spawn litellm; the second fails to bind the port but
-# the health poll still succeeds (the first bound it), leaving an orphan.
-if command -v flock >/dev/null 2>&1 && [[ "$ZIM_CLAUDE_NO_PROXY" != "1" ]]; then
-  exec 9>"${TMPDIR:-/tmp}/zim-claude-proxy.lock"
-  flock 9
-  ensure_proxy || true
-  flock -u 9
-  # bash sets no close-on-exec on fds opened with `exec N>`; don't leak fd 9.
-  exec 9>&-
-else
-  ensure_proxy || true
+close_tty() {
+  (( _tty_open )) || return 0
+  exec 3<&-
+  _tty_open=0
+}
+
+# --- the API key -------------------------------------------------------------
+
+API_KEY="${ZIM_CLAUDE_API_KEY:-${TOKENHARBOR_API_KEY:-}}"
+# A key that arrived from the environment is not the user's to retype: if it is
+# rejected, say so and stop. Only a key typed at the prompt is worth re-asking
+# for.
+key_from_env=0
+if [[ -n "$API_KEY" ]]; then key_from_env=1; fi
+
+# Strip what a copy-paste adds. A trailing CR or space inside the token is a
+# 401 that looks like a bad key.
+sanitize_key() {
+  printf '%s' "$1" | tr -d ' \t\r\n'
+}
+
+ask_key() {
+  open_tty || return 1
+  printf '\n' >&2
+  info "TokenHarbor API key — create one at https://tokenharbor.ai/dashboard/api-keys"
+  printf '  paste it here (input is hidden): ' >&2
+  local typed=""
+  IFS= read -r -s typed <&3 || typed=""
+  printf '\n' >&2
+  API_KEY="$(sanitize_key "$typed")"
+  [[ -n "$API_KEY" ]]
+}
+
+# --- talking to TokenHarbor --------------------------------------------------
+
+HTTP_CODE=""
+HTTP_BODY=""
+
+api_get() {
+  local out
+  # -sS would print curl's own error to stderr; capture the body and status and
+  # report both ourselves so the message names the host that failed.
+  out="$(curl -sS --max-time 20 \
+           -H "Authorization: Bearer $API_KEY" \
+           -H 'Accept: application/json' \
+           -w $'\n%{http_code}' \
+           "$BASE_URL$1" 2>/dev/null)" || out=$'\n000'
+  HTTP_CODE="${out##*$'\n'}"
+  HTTP_BODY="${out%$'\n'*}"
+  [[ "$HTTP_CODE" =~ ^[0-9]{3}$ ]] || HTTP_CODE=000
+}
+
+# Pull `"id":"..."` out of the models payload. grep/sed only — jq and python3
+# are not dependencies of this package, and the shape here is one flat list.
+parse_model_ids() {
+  grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+}
+
+# Free routes are advertised with a `:free` suffix (deepseek-v4.1-flash:free,
+# mimo-v2.6-flash:free, ...). th-rudder is free without the suffix.
+is_free_model() {
+  case "$1" in
+    *:free|th-rudder) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+model_label() {
+  case "$1" in
+    deepseek-v4.1-flash:free) printf 'DeepSeek V4.1 Flash' ;;
+    deepseek-v4-flash:free)   printf 'DeepSeek V4 Flash' ;;
+    mimo-v2.6-flash:free)     printf 'MiMo V2.6 Flash' ;;
+    mimo-v2.5:free)           printf 'MiMo V2.5' ;;
+    th-rudder)                printf 'TH-Rudder' ;;
+    *) printf '' ;;
+  esac
+}
+
+# --- the model picker --------------------------------------------------------
+
+MODEL=""
+
+choose_model() {
+  local -a free=()
+  local id
+
+  # Free routes first. A paid account still sees them, so this is the normal
+  # path either way; if the catalog ever stops advertising any, fall back to
+  # the whole list rather than refusing to start.
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    if is_free_model "$id"; then free+=("$id"); fi
+  done <<<"$ALL_IDS"
+
+  local note="free models"
+  if (( ${#free[@]} == 0 )); then
+    while IFS= read -r id; do
+      [[ -n "$id" ]] || continue
+      free+=("$id")
+    done <<<"$ALL_IDS"
+    note="no free model is advertised — all models"
+  fi
+
+  (( ${#free[@]} > 0 )) || die "$BASE_URL returned no models for this key."
+
+  # A pinned model is an override, not a preference: take it as given so a
+  # script can pin a paid model without the picker getting in the way.
+  if [[ -n "${ZIM_CLAUDE_MODEL:-}" ]]; then
+    MODEL="$ZIM_CLAUDE_MODEL"
+    return 0
+  fi
+
+  # Default to last time's pick when it is still on offer, so pressing Enter
+  # repeatedly is stable instead of drifting to whatever sorts first.
+  local default_n=1 previous=""
+  if [[ -r "$LAST_MODEL_FILE" ]]; then
+    previous="$(sanitize_key "$(cat "$LAST_MODEL_FILE" 2>/dev/null || true)")"
+  fi
+  local i
+  for i in "${!free[@]}"; do
+    if [[ -n "$previous" && "${free[$i]}" == "$previous" ]]; then
+      default_n=$((i + 1))
+    fi
+  done
+
+  open_tty || die "no terminal to choose a model on.
+       Set ZIM_CLAUDE_MODEL=<model-id> to skip the picker."
+
+  printf '\n' >&2
+  info "$note on ${BASE_URL#https://}"
+  for i in "${!free[@]}"; do
+    local label; label="$(model_label "${free[$i]}")"
+    if [[ -n "$label" ]]; then
+      printf '  %2d) %-26s %s\n' "$((i + 1))" "${free[$i]}" "$label" >&2
+    else
+      printf '  %2d) %s\n' "$((i + 1))" "${free[$i]}" >&2
+    fi
+  done
+
+  local reply="" choice=""
+  while :; do
+    printf '  select 1-%d [%d]: ' "${#free[@]}" "$default_n" >&2
+    IFS= read -r reply <&3 || reply=""
+    reply="$(printf '%s' "$reply" | tr -d ' \t\r\n')"
+    [[ -z "$reply" ]] && reply="$default_n"
+    if [[ "$reply" =~ ^[0-9]+$ ]] && (( reply >= 1 && reply <= ${#free[@]} )); then
+      choice="${free[$((reply - 1))]}"
+      break
+    fi
+    warn "not a choice: $reply"
+  done
+  MODEL="$choice"
+}
+
+remember_model() {
+  [[ -n "$MODEL" ]] || return 0
+  mkdir -p -- "$STATE_DIR" 2>/dev/null || return 0
+  chmod 700 -- "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$MODEL" >"$LAST_MODEL_FILE" 2>/dev/null || true
+}
+
+# --- validate the key and fetch the catalog ----------------------------------
+
+_prev_base_url="${ANTHROPIC_BASE_URL:-}"
+attempt=0
+
+while :; do
+  if [[ -z "$API_KEY" ]]; then
+    if ! ask_key; then
+      die "a TokenHarbor API key is required.
+       Get one at https://tokenharbor.ai/dashboard/api-keys, then either
+       paste it when prompted, or export ZIM_CLAUDE_API_KEY and re-run."
+    fi
+  fi
+
+  api_get /v1/models
+
+  case "$HTTP_CODE" in
+    200) break ;;
+    401|403)
+      if (( key_from_env )); then
+        die "TokenHarbor rejected ZIM_CLAUDE_API_KEY (HTTP $HTTP_CODE).
+       Rotate it at https://tokenharbor.ai/dashboard/api-keys."
+      fi
+      attempt=$((attempt + 1))
+      warn "TokenHarbor rejected that key (HTTP $HTTP_CODE)."
+      if (( attempt >= 3 )); then
+        die "giving up after 3 rejected keys.
+       Create or rotate one at https://tokenharbor.ai/dashboard/api-keys."
+      fi
+      API_KEY=""
+      continue
+      ;;
+    000)
+      die "could not reach $BASE_URL.
+       Check your connection, or set ZIM_CLAUDE_BASE_URL if the API lives
+       somewhere else."
+      ;;
+    *)
+      die "$BASE_URL/v1/models answered HTTP $HTTP_CODE.
+       ${HTTP_BODY:0:300}"
+      ;;
+  esac
+done
+
+# `|| true` because an empty match makes grep exit 1, and pipefail would turn
+# that into a silent exit 1 instead of the message below.
+ALL_IDS="$(printf '%s\n' "$HTTP_BODY" | parse_model_ids || true)"
+[[ -n "$ALL_IDS" ]] \
+  || die "$BASE_URL/v1/models returned no model ids for this key.
+       ${HTTP_BODY:0:300}"
+
+choose_model
+remember_model
+
+# --- hand off ----------------------------------------------------------------
+
+close_tty
+
+# Report the override rather than silently changing provider.
+if [[ -n "$_prev_base_url" && "$_prev_base_url" != "$BASE_URL" ]]; then
+  warn "overriding inherited ANTHROPIC_BASE_URL=$_prev_base_url -> $BASE_URL"
 fi
+
+info "model: $MODEL"
+
+# Process-scoped only: plain `claude` in this shell is untouched.
+export ANTHROPIC_BASE_URL="$BASE_URL"
+export ANTHROPIC_AUTH_TOKEN="$API_KEY"
+export ANTHROPIC_MODEL="$MODEL"
+
+# Claude Code names its background and /model-picker calls after Anthropic
+# tiers. There is no proxy to rewrite those names now, so point every tier at
+# the model that was chosen — otherwise `/model sonnet` asks TokenHarbor for
+# "claude-sonnet-4-5" and gets a 404.
+export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
+export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
+
+# Load-bearing. Claude Code prefers ANTHROPIC_AUTH_TOKEN (sent as
+# `Authorization: Bearer`) and falls back to ANTHROPIC_API_KEY (`x-api-key`) on
+# a truthiness test, so an empty string means the auth token wins — and it also
+# clears any real ANTHROPIC_API_KEY inherited from the shell.
+export ANTHROPIC_API_KEY=""
 
 # --- self-update -------------------------------------------------------------
 
 # Bring the installed package up to date in the background. Detached and
 # disowned so it can never delay, block or fail this session; the updater
 # rate-limits itself, refuses a dirty checkout, and only fast-forwards.
-#
-# Skipped entirely when ZIM_CLAUDE_NO_UPDATE=1. It also must not run before
-# the proxy check: the updater may replace the files this script is running
-# from, and bash has already read them, but keeping the ordering stable makes
-# the failure mode obvious if that ever changes.
 maybe_self_update() {
   [[ "${ZIM_CLAUDE_NO_UPDATE:-0}" == "1" ]] && return 0
-
   local updater="$_self_dir/zim-claude-update.sh"
-  # The installed copy lives beside the wrapper; a checkout that has not been
-  # installed yet simply has no updater and is left alone.
   [[ -x "$updater" ]] || return 0
-
-  # setsid detaches from the terminal's process group so a Ctrl-C, a closed
-  # window or a hangup does not kill a half-finished update. Fall back to a
-  # plain background job where setsid is unavailable (macOS).
   if command -v setsid >/dev/null 2>&1; then
     setsid "$updater" >/dev/null 2>&1 </dev/null &
   else
@@ -176,15 +345,7 @@ maybe_self_update() {
   return 0
 }
 
-# After the proxy is healthy, before exec. Backgrounded, so this costs a fork
-# and nothing else on the interactive path.
 maybe_self_update
-
-if [[ "$ZIM_CLAUDE_REQUIRE_PROXY" == "1" ]] && ! port_answers; then
-  die "proxy is not healthy on :${LITELLM_PORT} and ZIM_CLAUDE_REQUIRE_PROXY=1."
-fi
-
-# --- hand off ----------------------------------------------------------------
 
 # exec: no extra bash layer, so exit status, signal delivery and TTY ownership
 # all belong to claude. NOTE: exec discards EXIT traps — do not add one here.
