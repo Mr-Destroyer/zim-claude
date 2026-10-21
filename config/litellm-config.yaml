@@ -1,0 +1,39 @@
+# zim-claude · LiteLLM config for the Token Juice route
+#
+#   Claude Code (Anthropic /v1/messages) --▶ LiteLLM :4000 --▶ Token Juice (OpenAI)
+#
+# This file is a STARTING POINT, not the source of truth. The live copy lives
+# in ~/tokenjuice/ next to the credential profile, and install.sh only writes
+# it when it is not already there — an existing ~/tokenjuice/litellm-config.yaml
+# is the user's own model-name configuration and is never overwritten.
+#
+#   config dir   ${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}
+#   this file    <config dir>/litellm-config.yaml
+#   profile      <config dir>/source
+#
+# Token Juice serves exactly one chat model. Its upstream id carries a snapshot
+# suffix that Token Juice rotates, and naming a suffix that no longer exists
+# fails as a 404 "Model not found" rather than anything helpful. Re-read the
+# live catalog before changing the name below:
+#
+#   curl -s https://api.tokenjuice.ai/v1/models -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"
+
+general_settings:
+  # Required since litellm 1.104: without a master key the proxy refuses to
+  # start, because it would otherwise accept every request with no
+  # authentication. This proxy is a local translation shim in front of Token
+  # Juice, not a multi-tenant gateway, so the profile's own upstream token
+  # doubles as the proxy credential — zim-claude already sends it as the bearer
+  # token, so the request that worked before keeps working, while anything else
+  # on the box that finds the port is rejected.
+  master_key: os.environ/ANTHROPIC_AUTH_TOKEN
+
+model_list:
+  # The alias is what zim-claude (and anything else speaking Anthropic's
+  # protocol) asks for; the `model:` line is what Token Juice is actually
+  # called upstream.
+  - model_name: deepseek-v4.1-flash-1017
+    litellm_params:
+      model: openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+      api_base: https://api.tokenjuice.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN

@@ -160,10 +160,11 @@ fi
 
 log "updated ${local_rev:0:12} -> ${remote_rev:0:12}"
 
-# Install what was pulled. --no-rc avoids rewriting the user's shell config
-# from under them; stdin is closed so nothing can prompt.
+# Install what was pulled. --no-venv keeps a missing venv from turning into a
+# few-hundred-megabyte download in the background; --no-rc avoids rewriting the
+# user's shell config from under them. stdin is closed so nothing can prompt.
 if [[ -f "$repo/install.sh" ]]; then
-  bash "$repo/install.sh" --no-rc </dev/null >>"$LOG" 2>&1
+  bash "$repo/install.sh" --no-venv --no-rc </dev/null >>"$LOG" 2>&1
   log "installer exited $?"
 else
   log "no install.sh in $repo — files updated but not installed"

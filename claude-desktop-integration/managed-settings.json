@@ -1,0 +1,7 @@
+{
+  "inferenceProvider": "gateway",
+  "inferenceCredentialKind": "static",
+  "inferenceGatewayBaseUrl": "http://127.0.0.1:4002",
+  "inferenceGatewayApiKey": "sk-claude-desktop-local",
+  "inferenceGatewayAuthScheme": "bearer"
+}

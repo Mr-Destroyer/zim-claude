@@ -1,0 +1,67 @@
+# zim-claude · Claude Desktop integration — LiteLLM proxy config
+#
+#   Claude Desktop (Cowork / Chat / Code)
+#        |  POST /v1/messages   Authorization: Bearer <gateway key>
+#        v
+#   LiteLLM :4002   (this config, started by start-desktop-proxy.sh)
+#        |  OpenAI-style
+#        v
+#   Token Juice  ->  DeepSeek-V4.1-Flash-1017
+#
+# Claude Desktop imposes two hard requirements on the gateway:
+#
+#   1. Every model_name MUST look like an Anthropic/Claude model
+#      (contain "claude" or "anthropic"). Anything else is dropped
+#      from the picker with:
+#        inferenceModels: "X" is not an Anthropic model and was removed...
+#      That is why the upstream model is exposed under a claude-* name below.
+#
+#   2. drop_params: true — Cowork/Code sessions send Anthropic-only
+#      fields (cache_control, tool_reference, experimental beta
+#      headers) that a non-Anthropic upstream rejects with HTTP 400.
+#
+# The api_key is read from the environment; start-desktop-proxy.sh sources the
+# profile (default ~/tokenjuice/source) so ANTHROPIC_AUTH_TOKEN holds the Token
+# Juice key — the same secret and the same route the zim-claude CLI proxy uses.
+# The installed copy of this file lives in ~/tokenjuice/, next to that profile.
+
+model_list:
+  # DeepSeek-V4.1-Flash behind an Opus-shaped name so the Desktop picker
+  # accepts it and shows it as an Opus-tier model. The upstream id carries a
+  # snapshot suffix Token Juice rotates; re-read the live catalog before
+  # changing it:
+  #   curl -s https://api.tokenjuice.ai/v1/models -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"
+  - model_name: claude-opus-5-5
+    litellm_params:
+      model: openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+      api_base: https://api.tokenjuice.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+      drop_params: true
+
+  # --- Optional extra tiers -------------------------------------------------
+  # Token Juice serves exactly one chat model, so every tier is an alias onto
+  # the same upstream. Uncomment these if a Cowork/Code background task asks for
+  # a Sonnet- or Haiku-tier model by name:
+  #
+  # - model_name: claude-sonnet-4-5
+  #   litellm_params:
+  #     model: openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  #     api_base: https://api.tokenjuice.ai/v1
+  #     api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+  #     drop_params: true
+  #
+  # - model_name: claude-haiku-4-5
+  #   litellm_params:
+  #     model: openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+  #     api_base: https://api.tokenjuice.ai/v1
+  #     api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+  #     drop_params: true
+
+litellm_settings:
+  # Belt-and-braces: strip unsupported params globally too.
+  drop_params: true
+
+general_settings:
+  # Value Claude Desktop sends as "Gateway API key".
+  # Set by start-desktop-proxy.sh (default: sk-claude-desktop-local).
+  master_key: os.environ/CLAUDE_DESKTOP_LITELLM_KEY

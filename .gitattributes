@@ -7,8 +7,22 @@
 # pinned to LF.
 * text=auto eol=lf
 
-# Binary files: Git already sniffs these and skips conversion, but saying so
-# explicitly keeps a future eol rule from ever mangling an image.
+# cmd.exe's parser predates LF-only files and is unreliable with them
+# (notably around labels and `goto`). Let Git hand Windows the CRLF it expects.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Windows PowerShell reads LF fine, and keeping these LF means they diff
+# cleanly against their bash counterparts. Marked explicitly so a checkout on
+# Windows with autocrlf=true cannot silently convert them either.
+*.ps1 text eol=lf
+
+# No credential file is tracked here on purpose: the Token Juice key lives in
+# ~/tokenjuice/source (mode 600, outside the repo) and install.sh never writes
+# a secret into the checkout. See README.md, "Where the configuration lives".
+
+# Screenshots are binary. Git already sniffs them and skips conversion, but
+# saying so explicitly keeps a future eol rule from ever mangling an image.
 *.png binary
 *.jpg binary
 *.jpeg binary

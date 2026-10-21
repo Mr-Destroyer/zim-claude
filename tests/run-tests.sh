@@ -31,17 +31,11 @@ assert_contains() {
   else fail "$1" "expected to contain: $(printf '%q' "$2")"$'\n'"got: $3"; fi
 }
 
-# assert_lacks <label> <needle> <haystack>
-assert_lacks() {
-  if [[ "$3" != *"$2"* ]]; then pass "$1"
-  else fail "$1" "expected NOT to contain: $(printf '%q' "$2")"; fi
-}
-
 # ---------------------------------------------------------------- static ----
 
 section "static checks"
 
-for f in "$REPO/install.sh" "$REPO/scripts/zim-claude" "$REPO/scripts/zim-claude-update.sh" "$STUB"; do
+for f in "$REPO/install.sh" "$REPO/scripts/zim-claude" "$REPO/scripts/start-litellm.sh" "$STUB"; do
   if bash -n "$f" 2>/dev/null; then pass "syntax: ${f#"$REPO"/}"
   else fail "syntax: ${f#"$REPO"/}" "$(bash -n "$f" 2>&1)"; fi
 done
@@ -55,142 +49,382 @@ else
   skip "shellcheck not installed"
 fi
 
+# The live model-name configuration lives outside the repo, in ~/tokenjuice/,
+# and belongs to whoever put it there — install.sh only creates it when it is
+# missing. What must hold is that the shipped template, the installer and the
+# proxy all agree on the directory and on the model name.
+if grep -qF 'TOKENJUICE_DIR="${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}"' "$REPO/install.sh" &&
+   grep -qF 'TOKENJUICE_DIR="${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}"' "$REPO/scripts/zim-claude" &&
+   grep -qF 'CONFIG="${LITELLM_CONFIG:-$TOKENJUICE_DIR/litellm-config.yaml}"' "$REPO/scripts/start-litellm.sh" &&
+   grep -qF 'ENV_FILE="${LITELLM_ENV_FILE:-$TOKENJUICE_DIR/source}"' "$REPO/scripts/start-litellm.sh"; then
+  pass "config, profile and proxy agree on ~/tokenjuice"
+else
+  fail "config, profile and proxy disagree on ~/tokenjuice" \
+       "install.sh, scripts/zim-claude and scripts/start-litellm.sh must name the same directory"
+fi
+
+if grep -qF 'api_base: https://api.tokenjuice.ai/v1' "$REPO/config/litellm-config.yaml" &&
+   grep -qF 'model_name: deepseek-v4.1-flash-1017' "$REPO/config/litellm-config.yaml"; then
+  pass "shipped config targets Token Juice under the profile's model name"
+else fail "shipped config does not target Token Juice" \
+       "expected api.tokenjuice.ai and model_name deepseek-v4.1-flash-1017"; fi
+
+if grep -qF 'PROFILE_MODEL="${ZIM_CLAUDE_MODEL:-deepseek-v4.1-flash-1017}"' "$REPO/install.sh"; then
+  pass "installer's profile model matches the shipped config"
+else fail "installer's profile model drifts from the shipped config"; fi
+
+if grep -qF 'api_base: https://api.tokenjuice.ai/v1' "$REPO/claude-desktop-integration/litellm-config.desktop.yaml"; then
+  pass "desktop gateway config targets Token Juice too"
+else fail "desktop gateway config still points somewhere else"; fi
+
 # No hardcoded home directory anywhere — the package must work for any user.
 if hits="$(grep -rn '/home/zim' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
   fail "no hardcoded /home/zim" "$hits"
 else pass "no hardcoded /home/zim"; fi
 
-# The previous provider must be gone from the shipped surface. Its API host is
-# the thing that would silently keep working and hide a half-finished
-# migration. tests/ is excluded: it uses the old strings on purpose to
-# reproduce the old layout.
-if hits="$(grep -rni 'logfare\.ai' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no Logfare endpoint remains" "$hits"
-else pass "no Logfare endpoint remains"; fi
-
-# No Logfare key either. The bare prefix `lfu_` is still allowed, because
-# install.sh matches it to recognise and clean up a shell config from the old
-# version — that is a fingerprint, not a credential. A token has characters
-# after it.
-if hits="$(grep -rnE 'lfu_[A-Za-z0-9]' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no Logfare token remains" "$hits"
-else pass "no Logfare token remains"; fi
-
-if hits="$(grep -rni 'token.\?juice' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no Token Juice references remain" "$hits"
-else pass "no Token Juice references remain"; fi
-
-# TokenHarbor is the one upstream now, in the wrapper and the installer.
-if grep -qF 'https://tokenharbor.ai' "$REPO/scripts/zim-claude"; then
-  pass "wrapper defaults to the TokenHarbor API"
-else fail "wrapper does not point at TokenHarbor"; fi
-
-# No proxy: the whole LiteLLM layer (config, manager, virtualenv) is gone.
-for gone in scripts/start-litellm.sh config/litellm-config.yaml config/token \
-            windows claude-desktop-integration screenshots; do
-  if [[ -e "$REPO/$gone" ]]; then fail "$gone is gone"
-  else pass "$gone is gone"; fi
-done
-
-if grep -qE 'pip install|python3 -m venv|litellm --config' "$REPO/install.sh"; then
-  fail "installer no longer builds a proxy runtime" \
-       "install.sh still installs or launches litellm"
-else pass "installer no longer builds a proxy runtime"; fi
-
-# The only credential that ever shipped here was config/token. Nothing may
-# carry a secret now: keys are typed at run time and never written down.
-if grep -rqE 'sk-[A-Za-z0-9]{16,}|thk_(live|test)_[A-Za-z0-9]{16,}' "$REPO" \
-     --exclude-dir=.git --exclude-dir=tests 2>/dev/null; then
-  fail "no credential is shipped in the repo" "a key-shaped literal was found"
-else pass "no credential is shipped in the repo"; fi
-
-# --------------------------------------------------------------- readme ----
-
-section "readme"
-
-README="$REPO/README.md"
-if [[ -f "$README" ]]; then
-  pass "README present"
-  assert_contains "README names the new API host" "tokenharbor.ai" "$(cat "$README")"
-  assert_contains "README explains the per-run key prompt" "API key" "$(cat "$README")"
-  assert_contains "README documents the Desktop gateway" "Gateway" "$(cat "$README")"
-  assert_contains "README documents the custom model step" "Custom models" "$(cat "$README")"
-  assert_lacks "README has no Windows section" "## Windows" "$(cat "$README")"
-  # The migration section has to name what it is migrating *from*; what it must
-  # not do is tell anyone to install a proxy runtime.
-  assert_contains "README documents the migration" "Migrating from the LiteLLM version" "$(cat "$README")"
-  assert_lacks "README does not ask anyone to install litellm" "pip install" "$(cat "$README")"
+# --- the proxy virtualenv ---
+# install.sh builds the venv and start-litellm.sh looks for it. They are two
+# separate files that a future edit could easily move apart, and the failure is
+# silent: the installer would build a venv the proxy never looks in, and the
+# proxy would report "litellm not found" on a machine that just installed it.
+#
+# install.sh composes the path from $STATE_DIR, so the literal string only ever
+# appears in start-litellm.sh. Assert both halves: STATE_DIR is where the proxy
+# looks, and the venv hangs off it.
+if grep -qF 'STATE_DIR="$HOME/.local/share/zim-claude"' "$REPO/install.sh" &&
+   grep -qF 'PROXY_VENV="$STATE_DIR/venv"' "$REPO/install.sh" &&
+   grep -qF '$HOME/.local/share/zim-claude/venv' "$REPO/scripts/start-litellm.sh"; then
+  pass "venv path agreed by install.sh and start-litellm.sh"
 else
-  fail "README present"
+  fail "venv path disagrees between install.sh and start-litellm.sh" \
+       "install.sh would build a venv the proxy never looks for"
 fi
 
-# -------------------------------------------------------------- sandbox ----
+# Both floors are load-bearing, and lowering either fails in a way that still
+# looks healthy — so assert them by name rather than trusting a future edit.
+#   litellm>=1.100.1: older litellm 500s on /v1/messages for openai/* models
+#     (the only route Claude Code uses) while /v1/chat/completions keeps working.
+#   uvloop>=0.22.1: below that it imports BaseDefaultEventLoopPolicy, removed in
+#     Python 3.14, so the proxy dies at startup and never binds its port.
+if grep -qF 'litellm[proxy]>=1.100.1' "$REPO/install.sh"; then
+  pass "install.sh pins litellm[proxy]>=1.100.1"
+else fail "install.sh lost the litellm>=1.100.1 floor" "openai/* models would 500 on /v1/messages"; fi
+if grep -qF 'uvloop>=0.22.1' "$REPO/install.sh"; then
+  pass "install.sh pins uvloop>=0.22.1"
+else fail "install.sh lost the uvloop>=0.22.1 floor" "the proxy would die at startup on Python 3.14"; fi
+
+# The venv removes the reason --break-system-packages was ever needed. Leaving
+# that advice behind would send users back to mutating the system Python.
+if hits="$(grep -rn 'break-system-packages' "$REPO/install.sh" "$REPO/scripts" 2>/dev/null)"; then
+  fail "no --break-system-packages advice remains" "$hits"
+else pass "no --break-system-packages advice remains"; fi
+
+# No credential may live in this checkout: the key belongs in ~/tokenjuice/source
+# (mode 600), which install.sh never writes into the repo. A key committed here
+# would ship to everyone who clones it.
+if [[ -e "$REPO/config/token" || -e "$REPO/config/.token.b64" ]]; then
+  fail "no credential file in the checkout" "config/token (or .token.b64) exists"
+else pass "no credential file in the checkout"; fi
+
+if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
+             --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
+  fail "no live API key is committed" "$hits"
+else pass "no live API key is committed"; fi
+
+# The Token Juice route replaced two earlier providers. Neither may creep back in.
+if hits="$(grep -rniE 'logfare|tokenharbor' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
+  fail "no Logfare/TokenHarbor leftovers" "$hits"
+else pass "no Logfare/TokenHarbor leftovers"; fi
+
+# ------------------------------------------------------------- windows ------
+
+section "windows artifacts"
+
+# The Windows port is PowerShell, which this Linux box cannot execute (no pwsh).
+# What IS checkable here is that the files exist and that the shims point at the
+# right targets: a .bat wired to a renamed .ps1 is a silent, total failure that
+# no amount of review would catch, and it is exactly what a rename would break.
+for f in win-install.bat win-install.ps1 zim-claude.cmd zim-claude.ps1 \
+         start-proxies.ps1 verify.ps1 zim-claude-update.ps1; do
+  if [[ -f "$REPO/windows/$f" ]]; then pass "windows/$f present"
+  else fail "windows/$f present"; fi
+done
+
+# The Linux updater must ship and be executable: the wrapper only launches it
+# when it is, so a non-executable copy would silently disable auto-update.
+if [[ -x "$REPO/scripts/zim-claude-update.sh" ]]; then
+  pass "scripts/zim-claude-update.sh is executable"
+else
+  fail "scripts/zim-claude-update.sh is not executable" \
+       "the wrapper would skip it and auto-update would never run"
+fi
+
+# win-install.bat must invoke win-install.ps1.
+if grep -q 'win-install\.ps1' "$REPO/windows/win-install.bat" 2>/dev/null; then
+  pass "win-install.bat invokes win-install.ps1"
+else fail "win-install.bat does not reference win-install.ps1"; fi
+
+# zim-claude.cmd must invoke zim-claude.ps1.
+if grep -q 'zim-claude\.ps1' "$REPO/windows/zim-claude.cmd" 2>/dev/null; then
+  pass "zim-claude.cmd invokes zim-claude.ps1"
+else fail "zim-claude.cmd does not reference zim-claude.ps1"; fi
+
+# The wrapper must call the proxy manager by the name the installer ships it as.
+if grep -q "start-proxies\.ps1" "$REPO/windows/zim-claude.ps1" 2>/dev/null; then
+  pass "zim-claude.ps1 references start-proxies.ps1"
+else fail "zim-claude.ps1 does not reference start-proxies.ps1"; fi
+
+# Both .cmd shims must propagate the exit code, or failures are swallowed.
+for f in win-install.bat zim-claude.cmd start-proxies.cmd verify.cmd; do
+  if grep -q 'exit /b %ERRORLEVEL%' "$REPO/windows/$f" 2>/dev/null; then
+    pass "$f propagates ERRORLEVEL"
+  else fail "$f does not propagate ERRORLEVEL"; fi
+done
+
+# Every .ps1 that a user is told to run needs a .cmd/.bat shim beside it.
+# A bare .ps1 cannot be run by name, and on a Windows client the default
+# execution policy is Restricted - so a documented `start-proxies.ps1 status`
+# is blocked outright. The shims pass -ExecutionPolicy Bypass, which is scoped
+# to that one invocation and is the only reason the documented forms work.
+# This drifted once already: start-proxies.ps1 and verify.ps1 shipped without
+# shims while the README documented them as directly runnable.
+for ps1 in "$REPO"/windows/*.ps1; do
+  [[ -f "$ps1" ]] || continue
+  base="$(basename "$ps1" .ps1)"
+  if [[ -f "$REPO/windows/$base.cmd" || -f "$REPO/windows/$base.bat" ]]; then
+    pass "windows/$base.ps1 has a shim"
+  else
+    fail "windows/$base.ps1 has no .cmd/.bat shim" \
+         "a bare .ps1 is blocked by the default Windows execution policy"
+  fi
+done
+
+# Each shim must pass -ExecutionPolicy Bypass, or it does not solve that.
+for f in win-install.bat zim-claude.cmd start-proxies.cmd verify.cmd; do
+  if grep -q -- '-ExecutionPolicy Bypass' "$REPO/windows/$f" 2>/dev/null; then
+    pass "$f passes -ExecutionPolicy Bypass"
+  else fail "$f does not pass -ExecutionPolicy Bypass"; fi
+done
+
+# The Windows scripts must not hardcode a user's home directory.
+if hits="$(grep -rniE 'C:\\Users\\[A-Za-z0-9._-]+' "$REPO/windows" 2>/dev/null)"; then
+  fail "no hardcoded C:\\Users\\<name> in windows/" "$hits"
+else pass "no hardcoded C:\\Users\\<name> in windows/"; fi
+
+# The credential profile and the shared proxy manager must be installed for
+# EITHER side. Both proxies read the same ANTHROPIC_AUTH_TOKEN from that one
+# profile, so `win-install.bat -SkipCli` — the invocation the desktop README
+# recommends — would otherwise leave the :4002 gateway unable to authenticate.
+# Anchored on the guard line: Install-EnvProfile also appears inside its own
+# definition, so a bare grep would match unconditionally.
+if grep -qE '^if \(-not \$SkipCli -or -not \$SkipDesktop\)' "$REPO/windows/win-install.ps1" 2>/dev/null; then
+  pass "env profile installed for either side (not skipped with -SkipCli)"
+else
+  fail "win-install.ps1 gates the env profile on -SkipCli" \
+       "-SkipCli would leave the :4002 gateway with no ANTHROPIC_AUTH_TOKEN"
+fi
+
+# A dry run must not install prerequisites: Test-Prereqs shells out to winget,
+# pip and the Claude Code installer, so answering 'y' would mutate the machine
+# during -DryRun and contradict its "change nothing" contract.
+if grep -qE '^\s*if \(\$DryRun\) \{' "$REPO/windows/win-install.ps1" 2>/dev/null &&
+   awk '/^function Confirm-Install/,/^}/' "$REPO/windows/win-install.ps1" |
+     grep -q '\$DryRun'; then
+  pass "Confirm-Install is a no-op under -DryRun"
+else
+  fail "Confirm-Install ignores -DryRun" "-DryRun would still run winget/pip installs"
+fi
+
+# Add-UserPath must do BOTH of these, and they are not substitutes:
+#   - prepend to its own PATH, so the proxy manager it spawns can find litellm;
+#   - still warn that the user's shell is unchanged, since that is the one they
+#     type `zim-claude` into. Doing only the first hides why the command is
+#     "not recognized" in the window they are looking at.
+path_fn="$(awk '/^function Add-UserPath/,/^}/' "$REPO/windows/win-install.ps1")"
+if grep -qF '$env:Path = "$Dir;$env:Path"' <<<"$path_fn"; then
+  pass "Add-UserPath prepends to PATH for the current run"
+else
+  fail "Add-UserPath does not prepend to PATH" \
+       "the proxy manager it spawns would not find litellm"
+fi
+if grep -qF 'is not on PATH in THIS window' <<<"$path_fn"; then
+  pass "Add-UserPath still warns the user's shell is unchanged"
+else
+  fail "Add-UserPath stopped warning about the user's shell" \
+       "zim-claude would be 'not recognized' with nothing explaining it"
+fi
+
+# The gateway key printed for the Desktop dialog must honour
+# CLAUDE_DESKTOP_LITELLM_KEY, exactly as start-proxies.ps1 and verify.ps1 do.
+# A hardcoded default would print a key the proxy does not enforce, and the app
+# would get back {"error":{"message":"No connected db.",...}} — a key mismatch
+# that reads as a database problem.
+if grep -qF '$env:CLAUDE_DESKTOP_LITELLM_KEY' "$REPO/windows/win-install.ps1" 2>/dev/null; then
+  pass "win-install.ps1 honours CLAUDE_DESKTOP_LITELLM_KEY"
+else
+  fail "win-install.ps1 hardcodes the gateway key" \
+       "it would print a key the :4002 proxy rejects as 'No connected db.'"
+fi
+
+# --- script encoding ---
+# powershell.exe (Windows PowerShell 5.1, which both shims invoke) decodes a
+# BOM-less .ps1 with the machine's ANSI codepage, NOT UTF-8. An em dash is the
+# byte sequence E2 80 94; CP1252 maps 0x94 to a curly closing quote, and
+# PowerShell accepts that as a string terminator. One em dash inside a "..."
+# string therefore ends the string early, desynchronises every quote after it,
+# and the file dies with "Missing closing '}'" hundreds of lines away — the
+# reported line number has nothing to do with the real cause. cmd.exe reads its
+# own file through the OEM codepage and fails the same way. Keeping everything
+# the Windows port ships pure ASCII removes the codepage from the equation.
+for f in "$REPO"/windows/*; do
+  [[ -f "$f" ]] || continue
+  if LC_ALL=C grep -q '[^[:print:][:space:]]' "$f" 2>/dev/null; then
+    fail "windows/$(basename "$f") is pure ASCII" \
+         "non-ASCII bytes misparse under PowerShell 5.1 / cmd.exe on a non-UTF-8 codepage"
+  else
+    pass "windows/$(basename "$f") is pure ASCII"
+  fi
+done
+
+# Read-State must not hand out entries that lack a `path`. win-install.ps1 runs
+# under Set-StrictMode -Version 2.0, where reading a missing property is a fatal
+# PropertyNotFoundStrict error rather than $null - so one bad entry (older
+# revision, hand-edited file, stray null) aborts the install the moment a caller
+# touches .path. That is the "property 'path' cannot be found" crash at the
+# Test-FileIsOurs pipeline. The filter is what makes the property access safe.
+state_fn="$(awk '/^function Read-State/,/^}/' "$REPO/windows/win-install.ps1")"
+if grep -qF "PSObject.Properties['path']" <<<"$state_fn"; then
+  pass "Read-State filters entries without a path"
+else
+  fail "Read-State returns raw entries" \
+       "StrictMode 2.0 turns a missing .path into a fatal error mid-install"
+fi
+
+# The reader must use the same encoding the writer does. Set-Content -Encoding
+# UTF8 emits a BOM on PowerShell 5.1; reading that back under the ANSI default
+# prepends junk to the JSON and ConvertFrom-Json rejects it.
+if grep -qE 'Get-Content .*-Raw -Encoding UTF8' <<<"$state_fn"; then
+  pass "Read-State reads the state file as UTF8"
+else
+  fail "Read-State reads the state file with the default encoding" \
+       "the BOM written by Set-Content -Encoding UTF8 would corrupt the JSON"
+fi
+
+# --- line-ending policy ---
+# The .bat shims need CRLF; the bash side needs LF; nothing here holds a
+# credential any more (the key lives in ~/tokenjuice/source, mode 600).
+if [[ -f "$REPO/.gitattributes" ]]; then
+  pass ".gitattributes present"
+  if grep -qE '^[[:space:]]*config/token' "$REPO/.gitattributes"; then
+    fail ".gitattributes still pins a credential file" "config/token is no longer tracked"
+  else pass ".gitattributes carries no credential rule"; fi
+  if grep -qE '^[[:space:]]*\*\.bat[[:space:]]+text[[:space:]]+eol=crlf' "$REPO/.gitattributes"; then
+    pass ".gitattributes gives *.bat CRLF"
+  else fail ".gitattributes does not set *.bat eol=crlf"; fi
+else
+  fail ".gitattributes present" "a Windows checkout with autocrlf=true would corrupt the bash scripts"
+fi
+
+# ---------------------------------------------------------------- sandbox ---
 
 SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-XXXXXX")"
 trap 'rm -rf "$SBX"' EXIT
 
-# The wrapper calls curl to validate the key and fetch the catalog. A stub
-# answers from ZC_MODELS / ZC_STATUS so no test needs the network.
+# The installer probes localhost for a usable proxy port. Probing the REAL
+# ports would make every assertion depend on whatever proxies this machine
+# happens to be running, so the sandbox gets a stub curl that answers from
+# ZIM_TEST_BUSY / ZIM_TEST_ACCEPT instead of the network.
+#
+#   busy   : health 200, /v1/models 400  (a proxy with a different master key)
+#   accept : health 200, /v1/models 200  (a proxy that takes our token)
+#   other  : 000                         (nothing listening)
 STUB_BIN="$SBX/stubbin"
 mkdir -p "$STUB_BIN"
 cat > "$STUB_BIN/curl" <<'EOF'
 #!/usr/bin/env bash
-# Test stub for curl. Deliberately avoids ${VAR:-{...}} defaults: bash ends
-# such an expansion at the first unescaped '}', truncating a JSON default.
-code="${ZC_STATUS:-200}"
-body=""
-if [[ "$code" == "200" ]]; then
-  body="${ZC_MODELS}"
-  if [[ -z "$body" ]]; then
-    body='{"object":"list","data":[{"id":"claude-opus-5.5"},{"id":"deepseek-v4.1-flash:free"},{"id":"mimo-v2.6-flash:free"},{"id":"th-rudder"},{"id":"gpt-6-astra"}]}'
-  fi
+port=""
+health=0
+for a in "$@"; do
+  case "$a" in
+    http://127.0.0.1:*) port="${a#http://127.0.0.1:}"; port="${port%%/*}" ;;
+    */health/liveliness) health=1 ;;
+  esac
+done
+status=000
+case " ${ZIM_TEST_BUSY:-} " in *" $port "*) status=400 ;; esac
+case " ${ZIM_TEST_ACCEPT:-} " in *" $port "*) status=200 ;; esac
+if (( health )) && [[ -n "$port" ]]; then
+  case " ${ZIM_TEST_BUSY:-} ${ZIM_TEST_ACCEPT:-} " in *" $port "*) status=200 ;; esac
 fi
-printf '%s' "$body"
-printf '\n%s' "$code"
+printf '%s' "$status"
 EOF
 chmod +x "$STUB_BIN/curl"
 
+# Run the installer with a HOME that has no ~/.local/bin on PATH, which also
+# exercises the PATH-not-set branch. ZIM_CLAUDE_TOKEN is the scripted way in:
+# no credential ships in the repo, and there is no terminal to prompt on.
+SBX_TOKEN="tj_sandbox000000000000000000000000"
 sbx_install() {
   env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+    ZIM_CLAUDE_TOKEN="${ZIM_CLAUDE_TOKEN-$SBX_TOKEN}" \
+    ZIM_TEST_BUSY="${ZIM_TEST_BUSY:-}" ZIM_TEST_ACCEPT="${ZIM_TEST_ACCEPT:-}" \
     bash "$REPO/install.sh" "$@" </dev/null
 }
 
 section "install into sandbox \$HOME"
 
 sbx_install >/dev/null 2>&1
-# Exit 1 is expected: the sandbox PATH omits claude, so the installer reports a
-# missing prerequisite. Files still land.
+# Exit 1 is expected here: the sandbox PATH deliberately omits claude and
+# litellm, so the installer reports missing prerequisites. Files still land.
 assert_eq "installer reports missing prereqs as exit 1" "1" "$?"
 [[ -x "$SBX/.local/bin/zim-claude" ]] && pass "wrapper installed" || fail "wrapper installed"
-[[ -x "$SBX/.local/bin/zim-claude-update.sh" ]] && pass "updater installed" || fail "updater installed"
-[[ -e "$SBX/.local/share/zim-claude/venv" ]] \
-  && fail "no proxy virtualenv is built" "installer created a venv" \
-  || pass "no proxy virtualenv is built"
-[[ -e "$SBX/litellm-config.yaml" ]] \
-  && fail "no proxy config is installed" "litellm-config.yaml appeared" \
-  || pass "no proxy config is installed"
-[[ -e "$SBX/claude-source" ]] \
-  && fail "no credential profile is written" "installer created claude-source/" \
-  || pass "no credential profile is written"
+[[ -x "$SBX/.local/bin/start-litellm.sh" ]] && pass "start-litellm.sh installed" || fail "start-litellm.sh installed"
+[[ -f "$SBX/tokenjuice/litellm-config.yaml" ]] && pass "model config created in ~/tokenjuice" \
+  || fail "model config created in ~/tokenjuice"
+[[ -f "$SBX/tokenjuice/source" ]] && pass "profile created in ~/tokenjuice" || fail "profile created in ~/tokenjuice"
+[[ -e "$SBX/litellm-config.yaml" ]] && fail "no config left at ~/litellm-config.yaml" "old layout came back" \
+  || pass "no config left at ~/litellm-config.yaml"
+[[ -e "$SBX/claude-source" ]] && fail "no profile left at ~/claude-source" "old layout came back" \
+  || pass "no profile left at ~/claude-source"
 
+assert_eq "profile mode 600" "600" "$(stat -c%a "$SBX/tokenjuice/source" 2>/dev/null)"
+assert_eq "tokenjuice dir mode 700" "700" "$(stat -c%a "$SBX/tokenjuice" 2>/dev/null)"
 assert_eq "wrapper mode 755" "755" "$(stat -c%a "$SBX/.local/bin/zim-claude" 2>/dev/null)"
 assert_eq "state dir mode 700" "700" "$(stat -c%a "$SBX/.local/share/zim-claude" 2>/dev/null)"
+
+assert_contains "profile has base url on the Token Juice port" 'ANTHROPIC_BASE_URL="http://localhost:4000"' \
+  "$(cat "$SBX/tokenjuice/source")"
+assert_contains "profile clears ANTHROPIC_API_KEY" 'ANTHROPIC_API_KEY=""' \
+  "$(cat "$SBX/tokenjuice/source")"
+assert_contains "profile names the Token Juice model" 'ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"' \
+  "$(cat "$SBX/tokenjuice/source")"
 assert_contains "PATH persisted to environment.d" "$SBX/.local/bin" \
   "$(cat "$SBX/.config/environment.d/zim-claude.conf" 2>/dev/null)"
 assert_contains "bashrc marker block added" "# >>> zim-claude >>>" \
   "$(cat "$SBX/.bashrc" 2>/dev/null)"
 
+# ZIM_CLAUDE_TOKEN is what the installer wrote: no key comes from the checkout.
+got="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$SBX/tokenjuice/source")"
+assert_eq "installed token is the one that was supplied" "$SBX_TOKEN" "$got"
+
+# The shipped template must have landed byte-for-byte on a first install.
+if cmp -s "$REPO/config/litellm-config.yaml" "$SBX/tokenjuice/litellm-config.yaml"; then
+  pass "first install copies the shipped model config verbatim"
+else fail "first install copies the shipped model config verbatim" "the two files differ"; fi
+
 section "idempotency"
 
 out="$(sbx_install 2>&1)"
 assert_contains "second run reports unchanged" "unchanged: $SBX/.local/bin/zim-claude" "$out"
+assert_contains "second run keeps env file" "keeping existing env file" "$out"
 n="$(sbx_install --dry-run 2>&1 | grep -c 'would: install')"
 assert_eq "dry-run after install performs 0 installs" "0" "$n"
 n="$(grep -c 'zim-claude' "$SBX/.bashrc")"
 assert_eq "bashrc marker not duplicated" "3" "$n"
 
 # record_state appends a row per install, so a file installed more than once
-# has duplicate rows. The state file must still describe the file correctly.
+# has duplicate rows. recorded_hash must use the newest, or every later run
+# reports the file as user-modified and stops updating it.
 sbx_install --force >/dev/null 2>&1
 out="$(sbx_install 2>&1)"
 if [[ "$out" == *"you have modified this file"* ]]; then
@@ -199,231 +433,193 @@ if [[ "$out" == *"you have modified this file"* ]]; then
 else
   pass "repeated installs keep recognising their own files"
 fi
-assert_eq "state file lists only current files" "2" \
-  "$(wc -l < "$SBX/.local/share/zim-claude/installed.tsv")"
 
-# ----------------------------------------------------- legacy migration ----
+section "secret is never clobbered"
 
-section "migrating a LiteLLM-era install"
+# Save the good profile: this section deliberately corrupts it, and the
+# wrapper tests below need a complete one back.
+cp "$SBX/tokenjuice/source" "$SBX/good-profile"
 
-LEG="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-legacy-XXXXXX")"
-mkdir -p "$LEG/bin" "$LEG/.local/bin" "$LEG/.local/share/zim-claude/venv/bin" "$LEG/claude-source"
-ln -sf "$STUB" "$LEG/bin/claude"
-printf '#!/bin/bash\n' > "$LEG/.local/bin/start-litellm.sh"; chmod 755 "$LEG/.local/bin/start-litellm.sh"
-printf 'model_list: []\n' > "$LEG/litellm-config.yaml"
-printf 'litellm[proxy]>=1.100.1 uvloop>=0.22.1\n' > "$LEG/.local/share/zim-claude/venv/.litellm-req"
-printf '#!/bin/sh\n' > "$LEG/.local/share/zim-claude/venv/bin/litellm"
-printf 'export ANTHROPIC_AUTH_TOKEN="lfu_OLDKEY"\n' > "$LEG/claude-source/deepseek-claude"
-{
-  for f in .local/bin/start-litellm.sh litellm-config.yaml; do
-    printf '%s\t%s\t%s\n' "$LEG/$f" "$(sha256sum "$LEG/$f" | cut -d' ' -f1)" 755
-  done
-} > "$LEG/.local/share/zim-claude/installed.tsv"
-cat > "$LEG/.bashrc" <<'EOF'
+printf 'export ANTHROPIC_AUTH_TOKEN="sentinel-must-survive"\n' > "$SBX/tokenjuice/source"
+chmod 644 "$SBX/tokenjuice/source"
+sbx_install >/dev/null 2>&1
+assert_contains "token survives a re-install" "sentinel-must-survive" \
+  "$(cat "$SBX/tokenjuice/source")"
+assert_eq "re-install tightens the profile to 600" "600" \
+  "$(stat -c%a "$SBX/tokenjuice/source")"
+sbx_install --force >/dev/null 2>&1
+assert_contains "token survives --force" "sentinel-must-survive" \
+  "$(cat "$SBX/tokenjuice/source")"
+
+# Restore, so later sections test the wrapper against a real profile.
+cp "$SBX/good-profile" "$SBX/tokenjuice/source"
+chmod 600 "$SBX/tokenjuice/source"
+
+section "the shared model config is never rewritten"
+
+# ~/tokenjuice/litellm-config.yaml belongs to whoever put it there: other
+# harnesses on the box drive the same route, so install.sh only ever creates a
+# missing one. A config with hand-edited model names must survive - even --force.
+cat > "$SBX/tokenjuice/litellm-config.yaml" <<'EOF'
+# hand-written by the operator
+model_list:
+  - model_name: my-own-alias
+    litellm_params:
+      model: openai/some-upstream-model
+      api_base: https://api.tokenjuice.ai/v1
+      api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+EOF
+before="$(sha256sum "$SBX/tokenjuice/litellm-config.yaml" | cut -d' ' -f1)"
+out="$(sbx_install 2>&1)"
+assert_contains "an existing model config is used, not replaced" \
+  "using the model configuration already in place" "$out"
+sbx_install --force >/dev/null 2>&1
+after="$(sha256sum "$SBX/tokenjuice/litellm-config.yaml" | cut -d' ' -f1)"
+assert_eq "the model config is untouched even by --force" "$before" "$after"
+
+# Put the shipped one back for the sections that follow.
+cp "$REPO/config/litellm-config.yaml" "$SBX/tokenjuice/litellm-config.yaml"
+
+section "a foreign key is kept and reported"
+
+# Nothing in the repo can replace a key it did not issue, so a profile carrying
+# someone else's credential is kept - and said out loud, because Token Juice
+# will reject it.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_AUTH_TOKEN="sk-someone-elses-key"\n' >> "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"\n' >> "$SBX/tokenjuice/source"
+out="$(sbx_install 2>&1)"
+assert_contains "a foreign key is kept" "sk-someone-elses-key" "$(cat "$SBX/tokenjuice/source")"
+assert_contains "a foreign key is reported as not a Token Juice key" \
+  "does not look like a Token Juice key" "$out"
+assert_contains "the profile is reported as kept" "keeping existing env file" "$out"
+
+# A profile aimed at another provider is the user's own: never rewritten.
+printf 'export ANTHROPIC_BASE_URL="https://api.example-provider.test/v1"\n' > "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_AUTH_TOKEN="their-key"\n' >> "$SBX/tokenjuice/source"
+out="$(sbx_install 2>&1)"
+assert_contains "a profile aimed elsewhere keeps its key" "their-key" \
+  "$(cat "$SBX/tokenjuice/source")"
+assert_contains "a profile aimed elsewhere is reported as kept" \
+  "keeping existing env file" "$out"
+assert_eq "a kept profile is mode 600" "600" \
+  "$(stat -c%a "$SBX/tokenjuice/source" 2>/dev/null)"
+
+section "a missing key is reported, not guessed"
+
+# With no profile, no terminal and no ZIM_CLAUDE_TOKEN there is nothing to
+# install from. The installer must say so and still leave a usable CLI behind.
+NOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nokey-XXXXXX")"
+out="$(env -i HOME="$NOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" </dev/null 2>&1)"
+assert_contains "a missing key is named" "no Token Juice key available" "$out"
+assert_contains "the fix is spelled out" "ZIM_CLAUDE_TOKEN" "$out"
+[[ -x "$NOKEY_SBX/.local/bin/zim-claude" ]] && pass "CLI installs without a key" \
+  || fail "CLI installs without a key"
+[[ -e "$NOKEY_SBX/tokenjuice/source" ]] && fail "no profile is invented" "an empty profile was written" \
+  || pass "no profile is invented"
+rm -rf "$NOKEY_SBX"
+
+section "proxy port selection"
+
+# :4000 held by a proxy that rejects the token is the failure this machine
+# actually has: the profile says :4000, the proxy there answers every request
+# with "No connected db.", and zim-claude looks broken while the real problem
+# is the port. The installer must move the profile to a port that works.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_AUTH_TOKEN="tj_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_MODEL="deepseek-v4.1-flash"\n' >> "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_API_KEY=""\n' >> "$SBX/tokenjuice/source"
+out="$(ZIM_TEST_BUSY="4000 4001 4002 4003" ZIM_TEST_ACCEPT="4005" sbx_install 2>&1)"
+assert_contains "a proxy that rejects the token is reported" \
+  "rejects the profile's token" "$out"
+assert_contains "the profile follows a proxy that accepts it" \
+  'ANTHROPIC_BASE_URL="http://localhost:4005"' "$(cat "$SBX/tokenjuice/source")"
+assert_contains "the port move is explained" "moving the env profile to port :4005" "$out"
+assert_contains "the credential is kept, not replaced" \
+  "tj_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden" "$(cat "$SBX/tokenjuice/source")"
+if compgen -G "$SBX/.local/share/zim-claude/backups/*/tokenjuice__source" >/dev/null; then
+  pass "the port move backs up the profile"
+else fail "the port move backs up the profile" "no backup found"; fi
+
+# A free :4000 is fine: zim-claude starts its own proxy there.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_AUTH_TOKEN="tj_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/tokenjuice/source"
+out="$(sbx_install 2>&1)"
+assert_contains "a free port is kept" "free — zim-claude will start the proxy there" "$out"
+assert_contains "a free port leaves the profile alone" \
+  'ANTHROPIC_BASE_URL="http://localhost:4000"' "$(cat "$SBX/tokenjuice/source")"
+
+# --port overrides the search entirely, even when another port looks usable.
+out="$(ZIM_TEST_ACCEPT="4000" sbx_install --port 4100 2>&1)"
+assert_contains "--port is honoured" "proxy port: 4100 (--port)" "$out"
+
+# A port already accepting the token is not moved.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/tokenjuice/source"
+printf 'export ANTHROPIC_AUTH_TOKEN="tj_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"\n' >> "$SBX/tokenjuice/source"
+out="$(ZIM_TEST_ACCEPT="4000" sbx_install 2>&1)"
+assert_contains "a working port is reported as working" \
+  "already accepting the profile's token" "$out"
+
+section "shell rc migration"
+
+# ~/.bashrc commonly holds the same four exports. A stale key aimed at the
+# local proxy is a dead provider for plain `claude`, so it is rewritten - with
+# a backup - and the retired model name goes with it.
+cat > "$SBX/.bashrc" <<'EOF'
 # user's own file
 export EDITOR=vim
-export ANTHROPIC_BASE_URL="http://localhost:4001"
-export ANTHROPIC_AUTH_TOKEN="lfu_OLDKEY"
+export ANTHROPIC_BASE_URL="http://localhost:4000"
+export ANTHROPIC_AUTH_TOKEN="legacy-unissued-token"
 export ANTHROPIC_MODEL="deepseek-v4.1-flash"
 export ANTHROPIC_API_KEY=""
 alias ll='ls -l'
 EOF
-cp "$LEG/.bashrc" "$LEG/rc-orig"
+out="$(sbx_install 2>&1)"
+assert_contains "rc repair is announced" "replacing the stale key in $SBX/.bashrc" "$out"
+assert_contains "rc carries the Token Juice key" \
+  'export ANTHROPIC_AUTH_TOKEN="tj_cb4hVQ0yPUkv_PiugQ5onOIKdBqgiden"' "$(cat "$SBX/.bashrc")"
+assert_contains "rc picks up the current model name" \
+  'export ANTHROPIC_MODEL="deepseek-v4.1-flash-1017"' "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps unrelated exports" "export EDITOR=vim" "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps aliases" "alias ll='ls -l'" "$(cat "$SBX/.bashrc")"
+assert_contains "rc keeps the PATH marker block" "# >>> zim-claude >>>" "$(cat "$SBX/.bashrc")"
+if grep -q 'legacy-unissued-token\|ANTHROPIC_MODEL="deepseek-v4.1-flash"$' "$SBX/.bashrc"; then
+  fail "rc repair leaves no stale remnants" "old token or model survived"
+else pass "rc repair leaves no stale remnants"; fi
+if compgen -G "$SBX/.local/share/zim-claude/backups/*/.bashrc" >/dev/null; then
+  pass "rc repair backs up the file"
+else fail "rc repair backs up the file" "no .bashrc backup found"; fi
 
-leg_install() {
-  env -i HOME="$LEG" PATH="$LEG/bin:/usr/bin:/bin" TERM=dumb \
-    bash "$REPO/install.sh" "$@" </dev/null
-}
+# A profile aimed at another provider is the user's own: report it, never
+# rewrite it.
+printf 'export ANTHROPIC_BASE_URL="https://api.example-provider.test/v1"\n' > "$SBX/.bashrc"
+printf 'export ANTHROPIC_AUTH_TOKEN="sk-someone-elses-key"\n' >> "$SBX/.bashrc"
+out="$(sbx_install 2>&1)"
+assert_contains "a foreign rc token is left alone" "sk-someone-elses-key" "$(cat "$SBX/.bashrc")"
+assert_contains "a foreign rc token is still reported" \
+  "exports ANTHROPIC_*" "$out"
 
-out="$(leg_install 2>&1)"
-assert_contains "the old proxy manager is removed" "removing a file from the previous version" "$out"
-[[ -e "$LEG/.local/bin/start-litellm.sh" ]] \
-  && fail "start-litellm.sh removed" "still present" || pass "start-litellm.sh removed"
-[[ -e "$LEG/litellm-config.yaml" ]] \
-  && fail "litellm-config.yaml removed" "still present" || pass "litellm-config.yaml removed"
-[[ -e "$LEG/.local/share/zim-claude/venv" ]] \
-  && fail "old virtualenv removed" "still present" || pass "old virtualenv removed"
-[[ -e "$LEG/claude-source/deepseek-claude" ]] \
-  && pass "the old credential file is kept, not deleted" \
-  || fail "the old credential file is kept, not deleted" "installer deleted a credential"
-assert_contains "the dead credential is reported" "no longer read by anything" "$out"
-
-# The four exports aimed at a proxy that no longer exists are dead weight: they
-# would make plain `claude` hang. They go; everything else in the file stays.
-assert_lacks "the dead ANTHROPIC_* exports are gone" "ANTHROPIC_BASE_URL" "$(cat "$LEG/.bashrc")"
-assert_lacks "the old token is gone from the shell config" "lfu_OLDKEY" "$(cat "$LEG/.bashrc")"
-assert_contains "unrelated exports survive" "export EDITOR=vim" "$(cat "$LEG/.bashrc")"
-assert_contains "aliases survive" "alias ll='ls -l'" "$(cat "$LEG/.bashrc")"
-assert_contains "the PATH block is still added" "# >>> zim-claude >>>" "$(cat "$LEG/.bashrc")"
-
-b="$(find "$LEG/.local/share/zim-claude/backups" -name '.bashrc' 2>/dev/null | head -1)"
-if [[ -n "$b" ]] && cmp -s "$b" "$LEG/rc-orig"; then
-  pass "the backup holds the pre-install shell config"
-else
-  fail "the backup holds the pre-install shell config" \
-       "a later edit overwrote the first backup of the run"
-fi
-
-# A shell aimed at some other provider is the user's own: never rewritten.
-printf 'export ANTHROPIC_BASE_URL="https://api.example-provider.test/v1"\n' > "$LEG/.bashrc"
-printf 'export ANTHROPIC_AUTH_TOKEN="their-key"\n' >> "$LEG/.bashrc"
-leg_install >/dev/null 2>&1
-assert_contains "a foreign provider's shell config is untouched" "their-key" \
-  "$(cat "$LEG/.bashrc")"
-
-# --no-rc must not touch the shell config at all, cleanup included.
-printf 'export ANTHROPIC_BASE_URL="http://localhost:4001"\n' > "$LEG/.bashrc"
-printf 'export ANTHROPIC_AUTH_TOKEN="lfu_OLDKEY"\n' >> "$LEG/.bashrc"
-out="$(leg_install --no-rc 2>&1)"
-assert_contains "--no-rc keeps the stale exports" "lfu_OLDKEY" "$(cat "$LEG/.bashrc")"
+# --no-rc must not touch the shell config at all, repair included.
+printf 'export ANTHROPIC_BASE_URL="http://localhost:4000"\n' > "$SBX/.bashrc"
+printf 'export ANTHROPIC_AUTH_TOKEN="legacy-unissued-token"\n' >> "$SBX/.bashrc"
+out="$(sbx_install --no-rc 2>&1)"
+assert_contains "--no-rc keeps the stale key" "legacy-unissued-token" "$(cat "$SBX/.bashrc")"
 assert_contains "--no-rc says why" "left alone (--no-rc)" "$out"
-rm -rf "$LEG"
 
-# --------------------------------------------------------------- wrapper ---
+# Restore the shipped profile for the wrapper tests below.
+cp "$SBX/good-profile" "$SBX/tokenjuice/source"
+chmod 600 "$SBX/tokenjuice/source"
 
-section "wrapper: key handling"
+# ---------------------------------------------------------------- wrapper ---
+
+section "argument pass-through"
 
 ZC="$SBX/.local/bin/zim-claude"
-
-# Prompting needs a terminal, so those cases run under `script` with a pty.
-if ! command -v script >/dev/null 2>&1; then
-  skip "script(1) not available — cannot drive the interactive prompts"
-else
-  # zc_pty <stdin> <shell-snippet> [models-json]
-  zc_pty() {
-    printf '%s' "$1" | env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-      ZC_MODELS="${3:-}" ZC_STATUS="200" \
-      script -qec "$2" /dev/null 2>&1
-  }
-
-  # No key in the environment: the wrapper must ask, and the typed key must be
-  # the one it uses.
-  out="$(zc_pty $'thk_live_TYPED\n\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the wrapper asks for a key" "paste it here" "$out"
-  assert_contains "the typed key is accepted" "TOKEN_SET=yes" "$out"
-
-  # Enter with no key typed is not a key.
-  out="$(zc_pty $'\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "an empty key is refused" "a TokenHarbor API key is required" "$out"
-fi
-
-# A key from the environment skips the prompt entirely.
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_ENVKEY" \
-  ZIM_CLAUDE_MODEL="deepseek-v4.1-flash:free" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_STATE_DIR="$SBX/state" "$ZC" --version 2>&1)"
-assert_lacks "an environment key skips the prompt" "paste it here" "$out"
-assert_contains "an environment key is used" "TOKEN_SET=yes" "$out"
-
-# A rejected environment key is fatal — retyping it cannot help.
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb ZC_STATUS=401 \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_BAD" \
-  ZIM_CLAUDE_MODEL="deepseek-v4.1-flash:free" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_STATE_DIR="$SBX/state" "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "a rejected environment key exits 2" "2" "$?"
-assert_contains "a rejected environment key says where to rotate" \
-  "Rotate it at https://tokenharbor.ai/dashboard/api-keys" "$err"
-
-# No terminal and no key: fail closed rather than running against whatever
-# ANTHROPIC_* the shell happens to export.
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_STATE_DIR="$SBX/state" \
-  setsid "$ZC" --version 2>&1 >/dev/null </dev/null)"
-assert_eq "no terminal and no key exits 2" "2" "$?"
-assert_contains "no terminal explains the fix" "export ZIM_CLAUDE_API_KEY" "$err"
-
-section "wrapper: the free-model picker"
-
-if command -v script >/dev/null 2>&1; then
-  # The catalog has five ids, three of them free. Only the free ones are offered.
-  out="$(zc_pty $'thk_live_TYPED\n1\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "free models are listed" "deepseek-v4.1-flash:free" "$out"
-  assert_contains "a second free model is listed" "mimo-v2.6-flash:free" "$out"
-  assert_contains "th-rudder counts as free" "th-rudder" "$out"
-  assert_lacks "a paid model is not offered" "claude-opus-5.5" "$out"
-  assert_lacks "another paid model is not offered" "gpt-6-astra" "$out"
-
-  # Selecting the second entry uses the second free model.
-  out="$(zc_pty $'thk_live_TYPED\n2\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the second entry is selected" "MODEL=mimo-v2.6-flash:free" "$out"
-
-  # A remembered choice becomes the default, so Enter is stable. The first line
-  # is the key prompt, the empty second line accepts the default.
-  out="$(zc_pty $'thk_live_TYPED\n\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the last pick is remembered as the default" "select 1-3 [2]" "$out"
-
-  # Nonsense is re-asked, not accepted.
-  out="$(zc_pty $'thk_live_TYPED\n9\n1\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "an out-of-range choice is rejected" "not a choice: 9" "$out"
-  assert_contains "a valid choice still works after that" "MODEL=deepseek-v4.1-flash:free" "$out"
-
-  # A catalog with no :free ids falls back to the whole list instead of
-  # refusing to start.
-  out="$(zc_pty $'thk_live_TYPED\n\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version" \
-        '{"data":[{"id":"claude-opus-5.5"},{"id":"gpt-6-astra"}]}')"
-  assert_contains "a catalog with no free route says so" "no free model is advertised" "$out"
-  assert_contains "a catalog with no free route still offers models" "claude-opus-5.5" "$out"
-fi
-
-# A pinned model skips the picker entirely.
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_ENVKEY" \
-  ZIM_CLAUDE_MODEL="mimo-v2.6-flash:free" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_STATE_DIR="$SBX/state" "$ZC" --version 2>&1)"
-assert_lacks "a pinned model skips the picker" "free models on" "$out"
-assert_contains "a pinned model is used" "MODEL=mimo-v2.6-flash:free" "$out"
-
-section "wrapper: failure modes"
-
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb ZC_STATUS=000 \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_ENVKEY" \
-  ZIM_CLAUDE_MODEL="x" ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_STATE_DIR="$SBX/state" \
-  "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "an unreachable API exits 2" "2" "$?"
-assert_contains "an unreachable API names the host" "could not reach https://tokenharbor.ai" "$err"
-
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb ZC_MODELS='{"data":[]}' \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_ENVKEY" \
-  ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_STATE_DIR="$SBX/state" \
-  "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "an empty catalog exits 2" "2" "$?"
-assert_contains "an empty catalog says so" "returned no model ids" "$err"
-
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb ZC_STATUS=500 \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="thk_live_ENVKEY" \
-  ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_STATE_DIR="$SBX/state" \
-  "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "an unexpected status exits 2" "2" "$?"
-assert_contains "an unexpected status reports the code" "HTTP 500" "$err"
-
-env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN=/nonexistent/claude ZIM_CLAUDE_API_KEY="k" \
-  ZIM_CLAUDE_MODEL="m" ZIM_CLAUDE_NO_UPDATE=1 "$ZC" --version >/dev/null 2>&1
-assert_eq "missing claude binary exits 2" "2" "$?"
-
-# A non-zero exit from claude must pass through untouched, not become 2.
-cat > "$SBX/stub-fail" <<'EOF'
-#!/usr/bin/env bash
-exit 42
-EOF
-chmod +x "$SBX/stub-fail"
-env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$SBX/stub-fail" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 "$ZC" >/dev/null 2>&1
-assert_eq "claude's exit code passes through" "42" "$?"
-
-section "wrapper: argument pass-through"
-
-run_stub() { env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 "$ZC" "$@" 2>/dev/null; }
+# stderr is dropped here (and asserted separately where it matters) so the
+# wrapper's advisory warnings don't clutter the test log.
+run_stub() { env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 "$ZC" "$@" 2>/dev/null; }
 
 out="$(run_stub)"
 assert_eq "no args -> ARGC=0" "ARGC=0" "$(head -1 <<<"$out")"
@@ -449,77 +645,234 @@ out="$(run_stub "$(printf 'a\nb')" 'c"d')"
 assert_eq "newline/quote args -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
 assert_contains "  ...newline preserved" "[1]=<a" "$out"
 
-section "wrapper: environment"
+out="$(run_stub mcp list)"
+assert_eq "mcp list -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
+assert_contains "  ...subcommand forwarded" "[1]=<mcp>" "$out"
+
+section "environment handling"
 
 out="$(run_stub --version)"
-assert_contains "the API base URL is exported" "BASE_URL=https://tokenharbor.ai" "$out"
-assert_contains "the chosen model is exported" "MODEL=m" "$out"
-assert_contains "the auth token is exported" "TOKEN_SET=yes" "$out"
+assert_contains "profile base url reaches claude" "BASE_URL=http://localhost:4000" "$out"
+assert_contains "profile model reaches claude" "MODEL=deepseek-v4.1-flash-1017" "$out"
+assert_contains "auth token exported" "TOKEN_SET=yes" "$out"
 assert_contains "ANTHROPIC_API_KEY is empty" "APIKEY=<>" "$out"
 
-# Inherited ANTHROPIC_* must be replaced for this process and reported.
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 ANTHROPIC_BASE_URL="https://other.example/" "$ZC" --version 2>/dev/null)"
-assert_contains "an inherited base URL is overridden" "BASE_URL=https://tokenharbor.ai" "$out"
+# The regression test for the competing provider in ~/.bashrc.
+out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>/dev/null)"
+assert_contains "inherited base url is overridden" "BASE_URL=http://localhost:4000" "$out"
 
-err="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 ANTHROPIC_BASE_URL="https://other.example/" "$ZC" --version 2>&1 >/dev/null)"
-assert_contains "the override is reported on stderr" "overriding inherited ANTHROPIC_BASE_URL" "$err"
+err="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>&1 >/dev/null)"
+assert_contains "override is reported on stderr" "overriding inherited ANTHROPIC_BASE_URL" "$err"
 
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 ANTHROPIC_API_KEY="sk-a-real-key" "$ZC" --version 2>/dev/null)"
-assert_contains "an inherited API key is cleared" "APIKEY=<>" "$out"
+out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  ANTHROPIC_API_KEY="sk-a-real-looking-key" "$ZC" --version 2>/dev/null)"
+assert_contains "inherited API key is cleared" "APIKEY=<>" "$out"
 
-# set -a must not leak: only names the wrapper assigns are touched.
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 ZIM_TEST_UNRELATED="untouched" "$ZC" --version 2>/dev/null)"
-assert_contains "an unrelated env var survives" "UNRELATED=untouched" "$out"
+# set -a must not leak: only names the profile assigns are touched.
+out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  ZIM_TEST_UNRELATED="untouched" "$ZC" --version 2>/dev/null)"
+assert_contains "unrelated env var survives" "UNRELATED=untouched" "$out"
 
-section "wrapper: stdout hygiene and secrecy"
+out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 ZIM_TEST_CHECK_FDS=1 "$ZC" --version 2>/dev/null)"
+assert_contains "no flock fd leaks into claude" "FD_LEAK=no" "$out"
 
-out="$(env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_API_KEY="k" ZIM_CLAUDE_MODEL="m" \
-  ZIM_CLAUDE_NO_UPDATE=1 ANTHROPIC_BASE_URL="https://other.example/" "$ZC" --version 2>/dev/null)"
-assert_contains "the stub's output reaches stdout" "ARGC=1" "$out"
-assert_lacks "warnings stay off stdout" "overriding" "$out"
+section "fail-closed behaviour"
 
-# The key is a runtime secret: it must never be written anywhere.
-if command -v script >/dev/null 2>&1; then
-  zc_pty $'thk_live_NEVERONDISK\n\n' \
-    "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state ZIM_CLAUDE_NO_UPDATE=1 $ZC --version" \
-    >/dev/null 2>&1
-  if hits="$(grep -rl 'thk_live_NEVERONDISK' "$SBX" 2>/dev/null)"; then
-    fail "the typed key is never written to disk" "$hits"
-  else
-    pass "the typed key is never written to disk"
-  fi
-fi
+# Missing profile must be fatal: falling through would run against whatever
+# provider the user's shell already exports.
+env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  LITELLM_ENV_FILE=/nonexistent "$ZC" --version >/dev/null 2>&1
+assert_eq "missing env file exits 2" "2" "$?"
 
-# -------------------------------------------------------------- uninstall --
+err="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  LITELLM_ENV_FILE=/nonexistent "$ZC" --version 2>&1 >/dev/null)"
+assert_contains "missing env file explains why" "Refusing to run" "$err"
+
+printf 'export FOO=1\n' > "$SBX/bad-profile"
+env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  LITELLM_ENV_FILE="$SBX/bad-profile" "$ZC" --version >/dev/null 2>&1
+assert_eq "profile without a token exits 2" "2" "$?"
+
+env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN=/nonexistent/claude ZIM_CLAUDE_NO_PROXY=1 "$ZC" --version >/dev/null 2>&1
+assert_eq "missing claude binary exits 2" "2" "$?"
+
+# A non-zero exit from claude must pass through untouched, not become 2.
+cat > "$SBX/stub-fail" <<'EOF'
+#!/usr/bin/env bash
+exit 42
+EOF
+chmod +x "$SBX/stub-fail"
+env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$SBX/stub-fail" ZIM_CLAUDE_NO_PROXY=1 "$ZC" >/dev/null 2>&1
+assert_eq "claude's exit code passes through" "42" "$?"
+
+section "stdout hygiene"
+
+out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>/dev/null)"
+assert_contains "stub output reaches stdout" "ARGC=1" "$out"
+if [[ "$out" == *"overriding"* ]]; then fail "warnings stay off stdout" "found warning on stdout"
+else pass "warnings stay off stdout (clean)"; fi
+
+section "clean install with prerequisites present"
+
+# Same sandbox, but with claude and litellm reachable, so the installer should
+# report success rather than a prereq failure.
+PREREQ_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-prereq-XXXXXX")"
+mkdir -p "$PREREQ_SBX/bin"
+ln -sf "$STUB" "$PREREQ_SBX/bin/claude"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$PREREQ_SBX/bin/litellm"
+chmod +x "$PREREQ_SBX/bin/litellm"
+env -i HOME="$PREREQ_SBX" PATH="$PREREQ_SBX/bin:$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_TOKEN="$SBX_TOKEN" bash "$REPO/install.sh" </dev/null >/dev/null 2>&1
+assert_eq "installer exits 0 when prereqs present" "0" "$?"
+[[ -x "$PREREQ_SBX/.local/bin/zim-claude" ]] && pass "wrapper installed in clean sandbox" \
+  || fail "wrapper installed in clean sandbox"
+
+# litellm is already on PATH here, so the installer must REUSE it and build
+# nothing. Duplicating it into a venv would download litellm's whole dependency
+# tree for a user who already had one.
+[[ -e "$PREREQ_SBX/.local/share/zim-claude/venv" ]] \
+  && fail "existing litellm is reused, not duplicated" "installer built a venv anyway" \
+  || pass "existing litellm is reused, not duplicated"
+rm -rf "$PREREQ_SBX"
 
 section "uninstall"
 
 echo "# hand edit" >> "$SBX/.local/bin/zim-claude"
 sbx_install --uninstall >/dev/null 2>&1
-[[ -e "$SBX/.local/bin/zim-claude" ]] && pass "a modified file is left in place" \
-  || fail "a modified file is left in place"
-[[ -e "$SBX/.local/bin/zim-claude-update.sh" ]] \
-  && fail "an unmodified file is removed" "updater still present" \
-  || pass "an unmodified file is removed"
+[[ -e "$SBX/.local/bin/zim-claude" ]] && pass "modified file left in place" \
+  || fail "modified file left in place"
+[[ -e "$SBX/.local/bin/start-litellm.sh" ]] && fail "unmodified file removed" \
+  || pass "unmodified file removed"
+[[ -e "$SBX/tokenjuice/source" ]] && pass "user credential preserved" \
+  || fail "user credential preserved"
 n="$(grep -c 'zim-claude' "$SBX/.bashrc" 2>/dev/null || true)"
-assert_eq "the bashrc marker is removed" "0" "$n"
-[[ -e "$SBX/.config/environment.d/zim-claude.conf" ]] \
-  && fail "the environment.d entry is removed" "still present" \
-  || pass "the environment.d entry is removed"
+assert_eq "bashrc marker removed" "0" "$n"
+[[ -e "$SBX/.config/environment.d/zim-claude.conf" ]] && fail "environment.d entry removed" \
+  || pass "environment.d entry removed"
 
-# ---------------------------------------------------------- auto-update ----
+# ------------------------------------------------------- proxy venv -------
+
+section "proxy virtualenv"
+
+# No litellm anywhere, and no terminal: the installer must still finish (the
+# CLI half is fine) rather than blocking on a prompt or downloading litellm
+# unasked. This is the `curl | bash` path, and the one that used to advise
+# `pip install --break-system-packages`.
+VENV_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-venv-XXXXXX")"
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_TOKEN="$SBX_TOKEN" bash "$REPO/install.sh" </dev/null 2>&1)"
+assert_eq "no-litellm install still exits 1 for prereqs" "1" "$?"
+assert_contains "installer reports it skipped the venv" "skipping the proxy virtualenv" "$out"
+assert_contains "installer says the proxy has no litellm" "no litellm to run" "$out"
+[[ -x "$VENV_SBX/.local/bin/zim-claude" ]] && pass "wrapper still installed without a venv" \
+  || fail "wrapper still installed without a venv"
+[[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
+  && fail "no venv built without consent" "installer built one unprompted" \
+  || pass "no venv built without consent"
+
+# --no-venv must never even offer to build one.
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" --no-venv </dev/null 2>&1)"
+assert_contains "--no-venv reports the venv as disabled" "proxy virtualenv disabled" "$out"
+
+# Debian/Ubuntu ship python3 without the venv module. That is the one case the
+# venv approach cannot paper over, so it must be detected and named rather than
+# surfacing as a raw traceback. A stub python3 whose `-m venv --help` fails
+# reproduces it without needing a Debian box.
+NOVENV_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-novenv-XXXXXX")"
+mkdir -p "$NOVENV_SBX/bin"
+printf '#!/bin/sh\ncase "$*" in *"venv --help"*) exit 1;; *) exit 0;; esac\n' \
+  > "$NOVENV_SBX/bin/python3"
+chmod +x "$NOVENV_SBX/bin/python3"
+ln -sf "$STUB" "$NOVENV_SBX/bin/claude"
+out="$(env -i HOME="$NOVENV_SBX" PATH="$NOVENV_SBX/bin:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" </dev/null 2>&1)"
+assert_contains "venv-less python3 is reported, not crashed on" \
+  "has no venv module" "$out"
+assert_contains "venv-less python3 names the fix" "python3-venv" "$out"
+[[ -x "$NOVENV_SBX/.local/bin/zim-claude" ]] \
+  && pass "CLI still installs when the venv cannot be built" \
+  || fail "CLI still installs when the venv cannot be built"
+rm -rf "$NOVENV_SBX"
+
+# A venv that already has litellm is left completely alone — re-running the
+# installer must not rebuild it. The stub is enough: the installer only checks
+# that bin/litellm is executable.
+mkdir -p "$VENV_SBX/.local/share/zim-claude/venv/bin"
+printf '#!/bin/sh\nexit 0\n' > "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
+chmod +x "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
+printf '%s\n' 'litellm[proxy]>=1.100.1 uvloop>=0.22.1' \
+  > "$VENV_SBX/.local/share/zim-claude/venv/.litellm-req"
+out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_TOKEN="$SBX_TOKEN" bash "$REPO/install.sh" </dev/null 2>&1)"
+assert_contains "existing venv is found, not rebuilt" "existing virtualenv" "$out"
+# This sandbox has no `claude`, so the install still exits 1 for that reason —
+# what matters here is that the venv no longer counts as a missing prerequisite.
+if [[ "$out" == *"litellm not found"* ]]; then
+  fail "a found venv satisfies the litellm prerequisite" "installer still reported litellm missing"
+else
+  pass "a found venv satisfies the litellm prerequisite"
+fi
+
+# start-litellm.sh must actually FIND that venv with no litellm on PATH — the
+# whole point of the change. --help short-circuits before any proxy work, so
+# this is safe to run with a stub binary.
+resolved="$(env -i HOME="$VENV_SBX" PATH="/usr/bin:/bin" TERM=dumb bash -c '
+  set -euo pipefail
+  LITELLM_BIN=""
+  [[ -n "$LITELLM_BIN" ]] || LITELLM_BIN="$(command -v litellm 2>/dev/null || true)"
+  if [[ -z "$LITELLM_BIN" ]]; then
+    for _c in "$HOME/.local/bin/litellm" \
+              "${ZIM_CLAUDE_VENV:-$HOME/.local/share/zim-claude/venv}/bin/litellm"; do
+      [[ -x "$_c" ]] && LITELLM_BIN="$_c" && break
+    done
+  fi
+  printf "%s" "$LITELLM_BIN"')"
+assert_eq "proxy resolves the venv litellm when nothing is on PATH" \
+  "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm" "$resolved"
+
+# The stamp is the ownership marker --uninstall keys on. A venv carrying it is
+# ours and goes; the credential beside it still must not.
+env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" --uninstall </dev/null >/dev/null 2>&1
+[[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
+  && fail "uninstall removes the venv it built" "venv still present" \
+  || pass "uninstall removes the venv it built"
+[[ -e "$VENV_SBX/tokenjuice/source" ]] && pass "uninstall still preserves the credential" \
+  || fail "uninstall still preserves the credential"
+
+# A venv WITHOUT the stamp was made by the user, not by us, and must survive.
+mkdir -p "$VENV_SBX/.local/share/zim-claude/venv/bin"
+printf '#!/bin/sh\nexit 0\n' > "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
+chmod +x "$VENV_SBX/.local/share/zim-claude/venv/bin/litellm"
+env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" --uninstall </dev/null >/dev/null 2>&1
+[[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
+  && pass "uninstall keeps a venv it did not build" \
+  || fail "uninstall keeps a venv it did not build"
+rm -rf "$VENV_SBX"
+
+# ------------------------------------------------------- auto-update ------
 
 section "auto-update"
 
+# A throwaway origin and clone. The updater only ever talks to whatever
+# `origin` the checkout has, so a local bare repo exercises every path -
+# fast-forward, up to date, dirty, diverged - without network access.
 if ! command -v git >/dev/null 2>&1; then
   skip "git not installed - cannot exercise the updater"
 else
@@ -532,11 +885,11 @@ else
   git clone -q "$ORIGIN" "$CLONE" 2>/dev/null
   git -C "$CLONE" config user.name "Test"
   git -C "$CLONE" config user.email "test@example.invalid"
-  # Minimal checkout: the updater re-runs install.sh, so it must be present and
-  # must succeed without touching the network or the real $HOME.
+  # Minimal checkout: the updater re-runs install.sh, so it must be present
+  # and must succeed without touching the network or the real $HOME.
   cat > "$CLONE/install.sh" <<'EOF'
 #!/usr/bin/env bash
-printf 'installed %s (args: %s)\n' "$(cat "$(dirname "$0")/VERSION")" "$*" >> "${UPDATE_MARK:?}"
+printf 'installed %s\n' "$(cat "$(dirname "$0")/VERSION")" >> "${UPDATE_MARK:?}"
 EOF
   chmod +x "$CLONE/install.sh"
   printf 'v1\n' > "$CLONE/VERSION"
@@ -558,38 +911,40 @@ EOF
       bash "$REPO/scripts/zim-claude-update.sh" "$@"
   }
 
+  # 1. up to date: nothing is installed, but it still succeeds.
   up
   assert_eq "updater exits 0 when up to date" "0" "$?"
   assert_contains "updater reports up to date" "already up to date" \
     "$(cat "$STATE/update.log" 2>/dev/null)"
 
+  # 2. a new upstream commit is fast-forwarded and installed.
   git -C "$CLONE" pull -q origin "$branch"
   printf 'v2\n' > "$CLONE/VERSION"
   git -C "$CLONE" commit -qam v2
   git -C "$CLONE" push -q origin "$branch"
+  # Put the clone back one commit, so the updater has work to do.
   git -C "$CLONE" reset -q --hard HEAD~1
   up
   assert_contains "updater fast-forwards" "updated " "$(cat "$STATE/update.log")"
-  assert_eq "the fast-forward reaches the new commit" "v2" "$(cat "$CLONE/VERSION")"
-  assert_contains "the installer ran after the update" "installed v2" \
-    "$(cat "$STATE/mark" 2>/dev/null)"
-  # The updater must not pass flags the installer no longer has.
-  assert_contains "the updater calls the installer with --no-rc" "--no-rc" \
-    "$(cat "$STATE/mark" 2>/dev/null)"
-  assert_lacks "the updater does not pass a removed --no-venv" "--no-venv" \
+  assert_eq "fast-forward reaches the new commit" "v2" "$(cat "$CLONE/VERSION")"
+  assert_contains "installer ran after the update" "installed v2" \
     "$(cat "$STATE/mark" 2>/dev/null)"
 
+  # 3. a dirty checkout is left alone.
   printf 'local edit\n' >> "$CLONE/VERSION"
   before="$(git -C "$CLONE" rev-parse HEAD)"
+  git -C "$CLONE" pull -q origin "$branch" >/dev/null 2>&1 || true
   up
-  assert_contains "a dirty checkout is not updated" "has local changes" \
+  assert_contains "dirty checkout is not updated" "has local changes" \
     "$(cat "$STATE/update.log")"
-  assert_eq "a dirty checkout keeps its HEAD" "$before" "$(git -C "$CLONE" rev-parse HEAD)"
+  assert_eq "dirty checkout keeps its HEAD" "$before" "$(git -C "$CLONE" rev-parse HEAD)"
   git -C "$CLONE" checkout -q -- VERSION
 
+  # 4. a diverged branch (local commit) is not merged or reset.
   printf 'local\n' > "$CLONE/LOCAL"
   git -C "$CLONE" add -A
   git -C "$CLONE" commit -qm local-only
+  # Advance origin separately.
   other="$UP_SBX/other"
   git clone -q "$ORIGIN" "$other" 2>/dev/null
   git -C "$other" config user.name "Test"
@@ -599,11 +954,12 @@ EOF
   git -C "$other" push -q origin "$branch"
   before="$(git -C "$CLONE" rev-parse HEAD)"
   up
-  assert_contains "a diverged checkout is left alone" "has diverged" \
+  assert_contains "diverged checkout is left alone" "has diverged" \
     "$(cat "$STATE/update.log")"
-  assert_eq "a diverged checkout keeps its local commit" "$before" \
+  assert_eq "diverged checkout keeps its local commit" "$before" \
     "$(git -C "$CLONE" rev-parse HEAD)"
 
+  # 5. the rate limit: a second run inside the interval does nothing.
   rm -f "$STATE/last-update-check"
   up
   n1="$(wc -l < "$STATE/update.log")"
@@ -613,31 +969,37 @@ EOF
     ZIM_CLAUDE_UPDATE_LOG="$STATE/update.log" \
     bash "$REPO/scripts/zim-claude-update.sh"
   n2="$(wc -l < "$STATE/update.log")"
-  assert_eq "a second run inside the interval logs nothing" "$n1" "$n2"
+  assert_eq "second run inside the interval logs nothing" "$n1" "$n2"
 
+  # 6. opt-out and unconfigured installs are silent no-ops.
   : > "$STATE/update.log"
   printf 'ZIM_CLAUDE_AUTO_UPDATE=0\n' > "$STATE/update.conf"
   up
   assert_eq "auto-update=0 is a no-op" "0" "$(wc -l < "$STATE/update.log")"
   rm -f "$STATE/update.conf"
   up
-  assert_contains "a missing config is reported, not crashed on" "not configured" \
+  assert_contains "missing config is reported, not crashed on" "not configured" \
     "$(cat "$STATE/update.log")"
 
   rm -rf "$UP_SBX"
 fi
 
+# The wrapper must not run the updater when told not to, and must not fail when
+# the updater is absent.
 section "auto-update wiring"
 
 if grep -q 'ZIM_CLAUDE_NO_UPDATE' "$REPO/scripts/zim-claude"; then
-  pass "the wrapper honours ZIM_CLAUDE_NO_UPDATE"
-else fail "the wrapper ignores ZIM_CLAUDE_NO_UPDATE"; fi
+  pass "wrapper honours ZIM_CLAUDE_NO_UPDATE"
+else fail "wrapper ignores ZIM_CLAUDE_NO_UPDATE"; fi
 if grep -q 'zim-claude-update.sh' "$REPO/install.sh"; then
-  pass "the installer ships the updater"
-else fail "the installer does not ship the updater"; fi
+  pass "installer ships the updater"
+else fail "installer does not ship the updater"; fi
 if grep -q 'write_update_conf' "$REPO/install.sh"; then
-  pass "the installer records the checkout"
-else fail "the installer does not record the checkout"; fi
+  pass "installer records the checkout"
+else fail "installer does not record the checkout"; fi
+if grep -q 'zim-claude-update.ps1' "$REPO/windows/zim-claude.ps1"; then
+  pass "windows wrapper references the updater"
+else fail "windows wrapper does not reference the updater"; fi
 
 # ---------------------------------------------------------------- summary ---
 
