@@ -138,6 +138,28 @@ model_list:
       api_base: https://logfare.ai/v1
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
 
+  - model_name: gemini
+    litellm_params:
+      model: gemini/gemini-3.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # The free tier: 50 requests/day (resets 06:00 UTC). It is addressed as
+  # "openai/openrouter/free" with the endpoint spelled out rather than as
+  # "openrouter/openrouter/free" — both send "openrouter/free" to the API, but
+  # the router's cost-map lookup keys off the prefix, and under the openrouter/
+  # prefix it looks up a key ("openrouter/free") the cost map does not have.
+  # The 1M limit is declared here so the router's pre-call check does not
+  # filter this route out of exactly the long prompts it exists to serve.
+  - model_name: openrouter
+    litellm_params:
+      model: openai/openrouter/free
+      api_base: https://openrouter.ai/api/v1
+      api_key: os.environ/OPENROUTER_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 1048576
+      max_output_tokens: 32768
+
 router_settings:
   # Logfare meters a request budget per account, not per model, and answers a
   # spent budget with 429 "Your account has reached its request budget" — which
@@ -154,4 +176,4 @@ router_settings:
   # num_retries: 0 matters. A retry against a model whose budget is spent just
   # burns the same 429 again before the fallback is reached.
   num_retries: 0
-  default_fallbacks: ["gemma-4-26b"]
+  default_fallbacks: ["gemma-4-26b", "gemini", "openrouter"]
