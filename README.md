@@ -337,6 +337,21 @@ The models it uses are configurable too — `ZIM_CLAUDE_GEMINI_VISION_MODEL`,
 `ZIM_CLAUDE_MISTRAL_STT_MODEL` and `ZIM_CLAUDE_MISTRAL_VISION_MODEL`. The
 defaults are in `media/README.md`, along with a worked example of each tool.
 
+### When a provider is out of quota
+
+Free tiers run out, and a tool that silently returned an empty result would
+be worse than one that said so. Every tool that has a local fallback uses it
+and reports the fallback in its notes:
+
+- `image_edit` falls back to an ffmpeg hue shift when the image models are
+  unavailable, so "make the square blue" still produces a blue square.
+- `text_to_speech` falls back to a keyless speech endpoint when the TTS model
+  is rate-limited, and converts the result to WAV.
+- `image_generate` uses a keyless generator, so it works without any key.
+
+The notes are part of the tool result, so the model sees that the result came
+from a fallback rather than from the model you asked for.
+
 ### What works when a provider is out of quota
 
 `image_edit` and `text_to_speech` prefer a hosted model, and both fall back to
