@@ -25,7 +25,13 @@ Register it with Claude Code:
 claude mcp add zim-media --scope user -- node /path/to/zim-claude/media/mcp-server.mjs
 ```
 
-`install.sh` does this for you (see "Installing" below).
+`install.sh` does this for you (see "Installing" below). It registers the
+*installed* copy under `~/.local/share/zim-claude/media/`, so the command it
+runs is:
+
+```bash
+claude mcp add zim-media --scope user -- node "$HOME/.local/share/zim-claude/media/mcp-server.mjs"
+```
 
 ## Tools
 
