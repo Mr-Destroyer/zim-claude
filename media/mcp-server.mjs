@@ -28,7 +28,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdir, writeFile, readFile, stat } from 'node:fs/promises';
+import { mkdir, writeFile, readFile, stat, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -420,11 +420,10 @@ async function mp3ToWav(mp3) {
   } catch (err) {
     throw new Error(`could not convert the speech to WAV: ${(err.stderr || err.message || '').toString().slice(0, 300)}`);
   } finally {
-    const { unlink } = await import('node:fs/promises');
-    await unlink(tmp).catch(() => {});
+    await rm(tmp, { force: true }).catch(() => {});
   }
   const data = await readFile(wav);
-  await unlink(wav).catch(() => {});
+  await rm(wav, { force: true }).catch(() => {});
   return data;
 }
 
@@ -986,6 +985,11 @@ async function main() {
   CREDENTIALS_FILE = await loadCredentials();
   await ensureOutDir();
 
+  // Tool calls are slow (a video describe is a network round trip). If stdin
+  // closes while one is in flight, the answer would be lost, so every call is
+  // tracked and the process waits for them before exiting.
+  const pending = new Set();
+
   let buffer = '';
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', (chunk) => {
@@ -1001,12 +1005,19 @@ async function main() {
       } catch {
         continue; // ignore a malformed line rather than dying
       }
-      Promise.resolve(handle(parsed)).catch((err) => {
-        if (parsed && parsed.id !== undefined) sendError(parsed.id, -32603, err?.message || String(err));
-      });
+      const call = Promise.resolve(handle(parsed))
+        .catch((err) => {
+          if (parsed && parsed.id !== undefined) {
+            sendError(parsed.id, -32603, err?.message || String(err));
+          }
+        })
+        .finally(() => pending.delete(call));
+      pending.add(call);
     }
   });
-  process.stdin.on('end', () => process.exit(0));
+  process.stdin.on('end', () => {
+    Promise.allSettled([...pending]).finally(() => process.exit(0));
+  });
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGTERM', () => process.exit(0));
 }
