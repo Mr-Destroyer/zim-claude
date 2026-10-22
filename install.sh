@@ -9,8 +9,8 @@
 #   ./install.sh --help
 #
 # There is no local proxy any more: TokenHarbor serves the Anthropic Messages
-# API itself, so this installs a wrapper and an updater and nothing else. No
-# virtualenv, no LiteLLM, and no credential on disk.
+# API itself, so this installs a wrapper, an updater and the media MCP server,
+# and nothing else. No virtualenv, no LiteLLM, and no credential on disk.
 #
 # Everything is derived from $HOME, so this works for any user on any machine.
 
@@ -38,6 +38,12 @@ MARKER_END="# <<< zim-claude <<<"
 LEGACY_VENV="$STATE_DIR/venv"
 LEGACY_VENV_STAMP="$LEGACY_VENV/.litellm-req"
 LEGACY_ENV_PROFILE="$HOME/claude-source/deepseek-claude"
+
+# The media MCP server. It is dependency-free plain Node, so there is nothing
+# to build and nothing to install beside the file itself.
+MEDIA_DIR="$STATE_DIR/media"
+MEDIA_SERVER="$MEDIA_DIR/mcp-server.mjs"
+MEDIA_README="$MEDIA_DIR/README.md"
 
 # --- flags -------------------------------------------------------------------
 DRY_RUN=0 UNINSTALL=0 FORCE=0 TOUCH_RC=1
@@ -106,7 +112,8 @@ compact_state() {
   # Keep the newest row for each file this version actually installs; drop rows
   # for anything else, so a later --uninstall never looks for a stale path.
   awk -F'\t' -v a="$BIN_DIR/zim-claude" -v b="$BIN_DIR/zim-claude-update.sh" \
-    'NF >= 3 && ($1 == a || $1 == b) { row[$1] = $0 }
+    -v c="$MEDIA_SERVER" -v d="$MEDIA_README" \
+    'NF >= 3 && ($1 == a || $1 == b || $1 == c || $1 == d) { row[$1] = $0 }
      END { for (p in row) print row[p] }' \
     "$STATE_FILE" >"$tmp"
   cat -- "$tmp" >"$STATE_FILE"
@@ -173,7 +180,7 @@ install_file() {   # install_file <src> <dest> <mode>
 # from an older version and is stale.
 is_current_file() {
   case "$1" in
-    "$BIN_DIR/zim-claude"|"$BIN_DIR/zim-claude-update.sh") return 0 ;;
+    "$BIN_DIR/zim-claude"|"$BIN_DIR/zim-claude-update.sh"|"$MEDIA_SERVER"|"$MEDIA_README") return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -219,6 +226,89 @@ report_legacy_credential() {
   warn "  It holds the old Logfare key. Remove it when you like:"
   warn "    rm $LEGACY_ENV_PROFILE"
   return 0
+}
+
+# --- the media MCP server ----------------------------------------------------
+#
+# Claude Code can read an image, a video or an audio clip that the user
+# attaches, but it cannot make one: a generated image, an edited image or a
+# spoken track has to exist as a file before it can be Read. This MCP server
+# provides those steps, with the local fallbacks that always work.
+#
+# It is dependency-free plain Node, so there is nothing to build and no
+# runtime to install. Registering it with Claude Code is best effort: the
+# server is still usable by anyone who starts it by hand.
+
+install_media() {
+  if [[ ! -f "$SRC_DIR/media/mcp-server.mjs" ]]; then
+    warn "media/mcp-server.mjs is not in this checkout — skipping the media server"
+    return 0
+  fi
+
+  run mkdir -p -- "$MEDIA_DIR"
+  install_file "$SRC_DIR/media/mcp-server.mjs" "$MEDIA_SERVER" 755
+  install_file "$SRC_DIR/media/README.md"       "$MEDIA_README"  644
+}
+
+# node is the only thing the server needs. Any Node from 18 up does.
+find_node() {
+  local n
+  for n in "${ZIM_CLAUDE_NODE:-}" node nodejs; do
+    [[ -n "$n" ]] || continue
+    if command -v "$n" >/dev/null 2>&1; then
+      command -v "$n"
+      return 0
+    fi
+  done
+  return 1
+}
+
+register_media_mcp() {
+  local claude_bin node_bin out=""
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  if [[ -z "$claude_bin" ]]; then
+    warn "claude not found — not registering the zim-media MCP server."
+    warn "  Register it by hand:"
+    warn "    claude mcp add zim-media --scope user -- node $MEDIA_SERVER"
+    return 0
+  fi
+
+  if ! node_bin="$(find_node)"; then
+    warn "node not found — not registering the zim-media MCP server."
+    warn "  Register it by hand once Node is installed:"
+    warn "    claude mcp add zim-media --scope user -- node $MEDIA_SERVER"
+    return 0
+  fi
+
+  if (( DRY_RUN )); then
+    printf '    would register the zim-media MCP server: %s %s\n' "$node_bin" "$MEDIA_SERVER"
+    return 0
+  fi
+
+  # `claude mcp add` refuses to overwrite an existing entry, so remove first.
+  # Removing a server that was never registered is a no-op with exit 0.
+  "$claude_bin" mcp remove zim-media --scope user >/dev/null 2>&1 || true
+  if out="$("$claude_bin" mcp add zim-media --scope user -- "$node_bin" "$MEDIA_SERVER" 2>&1)"; then
+    if [[ "$out" == *"zim-media"* ]]; then
+      ok "registered the zim-media MCP server with Claude Code"
+    else
+      warn "claude did not confirm the zim-media MCP server registration."
+      warn "  Register it by hand:"
+      warn "    claude mcp add zim-media --scope user -- node $MEDIA_SERVER"
+    fi
+  else
+    warn "could not register the zim-media MCP server: $out"
+    warn "  Register it by hand:"
+    warn "    claude mcp add zim-media --scope user -- node $MEDIA_SERVER"
+  fi
+}
+
+unregister_media_mcp() {
+  local claude_bin
+  claude_bin="$(command -v claude 2>/dev/null || true)"
+  [[ -n "$claude_bin" ]] || return 0
+  say "removing the zim-media MCP server from Claude Code"
+  run "$claude_bin" mcp remove zim-media --scope user
 }
 
 # The four exports the old installer put in ~/.bashrc, recognised by pointing
@@ -487,11 +577,15 @@ do_uninstall() {
   #    by the old installer, so its presence is exactly "we made this".
   remove_legacy_venv
 
-  # 5. Never touch user data or credentials.
+  # 5. The MCP registration. The server file itself is removed by the state
+  #    file above; this is the entry in Claude Code's own config.
+  unregister_media_mcp
+
+  # 6. Never touch user data or credentials.
   say "keeping $LEGACY_ENV_PROFILE (delete it yourself if you want)"
   say "keeping $STATE_DIR/last-model (your last model choice)"
 
-  # 6. Auto-update bookkeeping. Removing it is the point: a later wrapper from
+  # 7. Auto-update bookkeeping. Removing it is the point: a later wrapper from
   #    a fresh install must not inherit a stale checkout path.
   if [[ -f "$UPDATE_CONF" ]]; then
     say "removing $UPDATE_CONF"
@@ -565,9 +659,11 @@ run mkdir -p -- "$STATE_DIR"
 run chmod 700 -- "$STATE_DIR"
 install_file "$SRC_DIR/scripts/zim-claude"          "$BIN_DIR/zim-claude"          755
 install_file "$SRC_DIR/scripts/zim-claude-update.sh" "$BIN_DIR/zim-claude-update.sh" 755
+install_media
 compact_state
 write_update_conf
 
+register_media_mcp
 ensure_path
 clean_legacy_shell_rc
 check_conflicts
@@ -580,6 +676,7 @@ fi
 ok "done. Run:  zim-claude"
 printf '   It will ask for a TokenHarbor API key, then show the free models.\n'
 printf '   Create a key at https://tokenharbor.ai/dashboard/api-keys\n'
+printf '   The zim-media MCP server is at %s\n' "$MEDIA_SERVER"
 
 (( PREREQ_FAILED )) && exit 1
 exit 0

@@ -130,6 +130,9 @@ directory to `PATH`.)
 |---|---|
 | `~/.local/bin/zim-claude` | the command |
 | `~/.local/bin/zim-claude-update.sh` | background self-updater (also runnable by hand) |
+| `~/.local/share/zim-claude/media/mcp-server.mjs` | the media MCP server (see [Media](#media)) |
+| `~/.local/share/zim-claude/media/README.md` | what that server can do |
+| `~/.local/share/zim-claude/media/out/` | files the media server produced |
 | `~/.local/share/zim-claude/update.conf` | which checkout and branch the updater tracks |
 | `~/.local/share/zim-claude/update.log` | what the updater did, last few hundred KB |
 | `~/.local/share/zim-claude/last-model` | the model you picked last time |
@@ -285,6 +288,62 @@ A key mismatch comes back as `{"error":{"message":"Invalid or revoked API key. �
 > Enabling third-party inference replaces the subscription account path for the
 > desktop app. Flip the provider back to default to return to your Claude
 > account.
+
+---
+
+## Media
+
+The Anthropic Messages API carries images, and it carries audio and video too,
+as long as the route behind it points at a multimodal model. What the API
+cannot do is hand you a *file*: a generated image, an edited image or a spoken
+track has to exist on disk before it can be Read, played or passed to another
+tool.
+
+`install.sh` installs a small MCP server, `zim-media`, that does those steps.
+It is dependency-free plain Node — no `npm install`, nothing to build — and it
+is registered with Claude Code as `zim-media`.
+
+| Tool | What it does |
+|---|---|
+| `media_describe` | describe an image, audio or video file, or answer a question about it |
+| `audio_transcribe` | transcribe speech to text |
+| `image_generate` | generate an image from a prompt and save it |
+| `image_edit` | edit an image with a natural-language instruction |
+| `image_transform` | local edits: crop, resize, rotate, flip, grayscale, recolor, brighten, contrast, saturate, blur, pad, annotate, convert |
+| `video_frames` | extract still frames from a video |
+| `text_to_speech` | turn text into a spoken WAV file |
+| `capabilities` | report which upstreams are configured and reachable |
+
+Results are written to `~/.local/share/zim-claude/media/out/`, and the tools
+report the path, so Claude Code can read the result back.
+
+### Credentials
+
+The server reads provider keys from the same shell profile the proxy launchers
+source — `~/.local/share/zim-claude/claude-source/deepseek-claude`, or whatever
+`ZIM_CLAUDE_ENV_FILE` points at. The real process environment wins over the
+file, so an exported key overrides it. Nothing is hardcoded in the server, and
+no key is written to disk by the installer.
+
+Set `ZIM_CLAUDE_ENV_FILE` to point it at a different profile:
+
+```bash
+ZIM_CLAUDE_ENV_FILE="$HOME/.config/zim-claude/providers" \
+  claude mcp add zim-media --scope user -- node "$HOME/.local/share/zim-claude/media/mcp-server.mjs"
+```
+
+The models it uses are configurable too — `ZIM_CLAUDE_GEMINI_VISION_MODEL`,
+`ZIM_CLAUDE_GEMINI_IMAGE_MODELS`, `ZIM_CLAUDE_GEMINI_TTS_MODEL`,
+`ZIM_CLAUDE_MISTRAL_STT_MODEL` and `ZIM_CLAUDE_MISTRAL_VISION_MODEL`. The
+defaults are in `media/README.md`, along with a worked example of each tool.
+
+### What works when a provider is out of quota
+
+`image_edit` and `text_to_speech` prefer a hosted model, and both fall back to
+something local when the provider is rate-limited or out of quota: an edit
+becomes a local hue shift or transform, and speech becomes a keyless render.
+The tool says which path it took, so the answer is never silently worse than
+it looks.
 
 ---
 

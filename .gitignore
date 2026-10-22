@@ -1,2 +1,4 @@
 claude-source/
 litellm-config.yaml
+.probe_*.sh
+litellm-config.yaml.bak-*

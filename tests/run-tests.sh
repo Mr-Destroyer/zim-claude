@@ -120,9 +120,51 @@ if [[ -f "$README" ]]; then
   # not do is tell anyone to install a proxy runtime.
   assert_contains "README documents the migration" "Migrating from the LiteLLM version" "$(cat "$README")"
   assert_lacks "README does not ask anyone to install litellm" "pip install" "$(cat "$README")"
+  # The media server is part of the package now, so the README has to say so.
+  assert_contains "README documents the media server" "## Media" "$(cat "$README")"
+  assert_contains "README names the media tools" "media_describe" "$(cat "$README")"
+  assert_contains "README explains where media results land" "media/out" "$(cat "$README")"
 else
   fail "README present"
 fi
+
+# ------------------------------------------------------------ media server ----
+
+section "media MCP server"
+
+MEDIA_SRC="$REPO/media/mcp-server.mjs"
+if [[ -f "$MEDIA_SRC" ]]; then
+  pass "media server present"
+  # The server has to run on a bare Node: no npm install, no dependencies.
+  # Every module specifier has to be a Node built-in.
+  specs="$(grep -oE "(from|require\()[[:space:]]*['\"][^'\"]+['\"]" "$MEDIA_SRC" \
+           | grep -oE "['\"][^'\"]+['\"]" | tr -d "'\"" | sort -u || true)"
+  if [[ -z "$specs" ]]; then
+    fail "media server imports only Node built-ins" "no module specifiers found"
+  elif grep -qv '^node:' <<<"$specs"; then
+    fail "media server imports only Node built-ins" \
+         "$(grep -v '^node:' <<<"$specs" | tr '\n' ' ')"
+  else
+    pass "media server imports only Node built-ins"
+  fi
+
+  if command -v node >/dev/null 2>&1; then
+    if node --check "$MEDIA_SRC" >/dev/null 2>&1; then
+      pass "media server parses under node"
+    else fail "media server parses under node" "$(node --check "$MEDIA_SRC" 2>&1 | head -3)"; fi
+  else
+    skip "node not installed — media server not parsed"
+  fi
+else
+  fail "media server present"
+fi
+
+# The media server talks to providers with keys the user supplies; no key may
+# be baked into the source.
+if hits="$(grep -rnE 'sk-[A-Za-z0-9]{16,}|thk_(live|test)_[A-Za-z0-9]{16,}' \
+             "$REPO/media" 2>/dev/null)"; then
+  fail "media server ships no credential" "$hits"
+else pass "media server ships no credential"; fi
 
 # -------------------------------------------------------------- sandbox ----
 
@@ -163,6 +205,10 @@ sbx_install >/dev/null 2>&1
 assert_eq "installer reports missing prereqs as exit 1" "1" "$?"
 [[ -x "$SBX/.local/bin/zim-claude" ]] && pass "wrapper installed" || fail "wrapper installed"
 [[ -x "$SBX/.local/bin/zim-claude-update.sh" ]] && pass "updater installed" || fail "updater installed"
+[[ -x "$SBX/.local/share/zim-claude/media/mcp-server.mjs" ]] \
+  && pass "media MCP server installed" || fail "media MCP server installed"
+[[ -f "$SBX/.local/share/zim-claude/media/README.md" ]] \
+  && pass "media README installed" || fail "media README installed"
 [[ -e "$SBX/.local/share/zim-claude/venv" ]] \
   && fail "no proxy virtualenv is built" "installer created a venv" \
   || pass "no proxy virtualenv is built"
@@ -199,7 +245,7 @@ if [[ "$out" == *"you have modified this file"* ]]; then
 else
   pass "repeated installs keep recognising their own files"
 fi
-assert_eq "state file lists only current files" "2" \
+assert_eq "state file lists only current files" "4" \
   "$(wc -l < "$SBX/.local/share/zim-claude/installed.tsv")"
 
 # ----------------------------------------------------- legacy migration ----
