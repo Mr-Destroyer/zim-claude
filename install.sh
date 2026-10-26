@@ -308,8 +308,9 @@ install_config_yaml() {
 
 # The env file is special: it holds a live credential, so it is never
 # overwritten — not even with --force. Losing it would mean re-issuing a token.
-# No credential ships in this checkout: the key is either already in the
-# profile, in $ZIM_CLAUDE_TOKEN for a scripted install, or typed at a prompt.
+# The key comes from the profile if it has one, then $ZIM_CLAUDE_TOKEN for a
+# scripted install, then the public key shipped in config/token. A prompt is
+# only the last resort, for a checkout whose config/token was removed.
 #
 # One thing is repaired, with a backup: a profile aimed at the local proxy whose
 # base URL names a port that rejects its own token. That is a real machine —
@@ -348,6 +349,14 @@ install_config_env() {
   if [[ -n "${ZIM_CLAUDE_TOKEN:-}" ]]; then
     token="$(printf '%s' "$ZIM_CLAUDE_TOKEN" | tr -d ' \t\r\n')"
     src="ZIM_CLAUDE_TOKEN"
+  fi
+
+  # No key on the command line: load the public Token Juice key that ships with
+  # this checkout, so a fresh install never stops to ask. Trims whitespace and
+  # the CR a Windows checkout can leave behind.
+  if [[ -z "$token" && -f "$SRC_DIR/config/token" ]]; then
+    token="$(tr -d ' \t\r\n' <"$SRC_DIR/config/token" || true)"
+    src="$SRC_DIR/config/token"
   fi
 
   PROFILE_TOKEN_EFFECTIVE="$token"
@@ -393,7 +402,7 @@ install_config_env() {
 
   if [[ -z "$token" ]]; then
     if (( DRY_RUN )); then
-      printf '    would ask for a Token Juice key (none ships in the repo)\n'
+      printf '    would ask for a Token Juice key (config/token is missing or empty)\n'
       return 0
     fi
     # Nothing to install from and no credential in the profile: ask for one.
@@ -403,8 +412,8 @@ install_config_env() {
       src="the key you typed"
     else
       err "no Token Juice key available."
-      err "  either export ZIM_CLAUDE_TOKEN=tj_… and re-run, or create"
-      err "  $ENV_FILE by hand:"
+      err "  either restore $SRC_DIR/config/token, export ZIM_CLAUDE_TOKEN=tj_…"
+      err "  and re-run, or create $ENV_FILE by hand:"
       err "    export ANTHROPIC_AUTH_TOKEN=\"tj_…\""
       return 1
     fi

@@ -119,17 +119,20 @@ if hits="$(grep -rn 'break-system-packages' "$REPO/install.sh" "$REPO/scripts" 2
   fail "no --break-system-packages advice remains" "$hits"
 else pass "no --break-system-packages advice remains"; fi
 
-# No credential may live in this checkout: the key belongs in ~/tokenjuice/source
-# (mode 600), which install.sh never writes into the repo. A key committed here
-# would ship to everyone who clones it.
-if [[ -e "$REPO/config/token" || -e "$REPO/config/.token.b64" ]]; then
-  fail "no credential file in the checkout" "config/token (or .token.b64) exists"
-else pass "no credential file in the checkout"; fi
+# The public Token Juice key ships in config/token so a fresh install loads it
+# instead of stopping to prompt. It is deliberately public, and the profile
+# copies it; anyone can replace it later. Any OTHER live-looking key in the
+# checkout is still a leak.
+if [[ -f "$REPO/config/token" ]] && \
+   grep -qxE 'tj_[A-Za-z0-9_-]{16,}' "$REPO/config/token"; then
+  pass "the public key ships in config/token"
+else fail "the public key ships in config/token" "config/token is missing or malformed"; fi
 
 if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
-             --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no live API key is committed" "$hits"
-else pass "no live API key is committed"; fi
+             --exclude-dir=.git --exclude-dir=tests 2>/dev/null \
+             | grep -v "^$REPO/config/token:")"; then
+  fail "no other live API key is committed" "$hits"
+else pass "no other live API key is committed"; fi
 
 # The Token Juice route replaced two earlier providers. Neither may creep back in.
 if hits="$(grep -rniE 'logfare|tokenharbor' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
@@ -361,8 +364,8 @@ EOF
 chmod +x "$STUB_BIN/curl"
 
 # Run the installer with a HOME that has no ~/.local/bin on PATH, which also
-# exercises the PATH-not-set branch. ZIM_CLAUDE_TOKEN is the scripted way in:
-# no credential ships in the repo, and there is no terminal to prompt on.
+# exercises the PATH-not-set branch. ZIM_CLAUDE_TOKEN is the scripted way in;
+# it must override the public key that ships in config/token.
 SBX_TOKEN="tj_sandbox000000000000000000000000"
 sbx_install() {
   env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
@@ -403,7 +406,7 @@ assert_contains "PATH persisted to environment.d" "$SBX/.local/bin" \
 assert_contains "bashrc marker block added" "# >>> zim-claude >>>" \
   "$(cat "$SBX/.bashrc" 2>/dev/null)"
 
-# ZIM_CLAUDE_TOKEN is what the installer wrote: no key comes from the checkout.
+# ZIM_CLAUDE_TOKEN wins over the public key that ships in config/token.
 got="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$SBX/tokenjuice/source")"
 assert_eq "installed token is the one that was supplied" "$SBX_TOKEN" "$got"
 
@@ -505,20 +508,39 @@ assert_contains "a profile aimed elsewhere is reported as kept" \
 assert_eq "a kept profile is mode 600" "600" \
   "$(stat -c%a "$SBX/tokenjuice/source" 2>/dev/null)"
 
+section "a fresh install loads the shipped key"
+
+# With no profile, no terminal and no ZIM_CLAUDE_TOKEN the installer must take
+# the public key from config/token rather than stopping to prompt.
+AUTOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-autokey-XXXXXX")"
+out="$(env -i HOME="$AUTOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" </dev/null 2>&1)"
+assert_contains "the shipped key is used without a prompt" "writing env file" "$out"
+got="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$AUTOKEY_SBX/tokenjuice/source" 2>/dev/null)"
+assert_eq "profile carries the public key from config/token" \
+  "$(tr -d ' \t\r\n' < "$REPO/config/token")" "$got"
+[[ -x "$AUTOKEY_SBX/.local/bin/zim-claude" ]] && pass "CLI installs without being asked" \
+  || fail "CLI installs without being asked"
+rm -rf "$AUTOKEY_SBX"
+
 section "a missing key is reported, not guessed"
 
-# With no profile, no terminal and no ZIM_CLAUDE_TOKEN there is nothing to
-# install from. The installer must say so and still leave a usable CLI behind.
+# A checkout whose config/token was deleted, with no profile, no terminal and no
+# ZIM_CLAUDE_TOKEN, has nothing to install from. It must say so and still leave
+# a usable CLI behind.
 NOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nokey-XXXXXX")"
+NOKEY_REPO="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nokey-repo-XXXXXX")"
+cp -a "$REPO/." "$NOKEY_REPO/"
+rm -f "$NOKEY_REPO/config/token"
 out="$(env -i HOME="$NOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  bash "$REPO/install.sh" </dev/null 2>&1)"
+  bash "$NOKEY_REPO/install.sh" </dev/null 2>&1)"
 assert_contains "a missing key is named" "no Token Juice key available" "$out"
 assert_contains "the fix is spelled out" "ZIM_CLAUDE_TOKEN" "$out"
 [[ -x "$NOKEY_SBX/.local/bin/zim-claude" ]] && pass "CLI installs without a key" \
   || fail "CLI installs without a key"
 [[ -e "$NOKEY_SBX/tokenjuice/source" ]] && fail "no profile is invented" "an empty profile was written" \
   || pass "no profile is invented"
-rm -rf "$NOKEY_SBX"
+rm -rf "$NOKEY_SBX" "$NOKEY_REPO"
 
 section "proxy port selection"
 

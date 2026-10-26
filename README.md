@@ -65,10 +65,10 @@ win-install.bat</code></pre>
 
 That's it. Open a new terminal and run `zim-claude`.
 
-The installer needs a **Token Juice API key** (create one at
-[tokenjuice.ai](https://tokenjuice.ai)). It asks for it with the input hidden, unless you
-already have one in `~/tokenjuice/source` — in which case it uses that and never
-overwrites it. For an unattended install, pass it in:
+A **public Token Juice API key ships in `config/token`**, so the installer loads it and
+carries on without asking. If you already have a key in `~/tokenjuice/source`, that one is
+kept and never overwritten. To use your own key (create one at
+[tokenjuice.ai](https://tokenjuice.ai)) on a fresh install, pass it in:
 
 ```bash
 ZIM_CLAUDE_TOKEN=tj_… ./install.sh
@@ -218,8 +218,8 @@ harnesses on the machine, so an existing profile and an existing model config ar
 as they are and never rewritten, `--force` included. If the profile already holds a key,
 it is kept — with a warning when it does not look like a Token Juice key (`tj_…`),
 because Token Juice will reject a key issued elsewhere. If there is no profile at all,
-the installer takes the key from `ZIM_CLAUDE_TOKEN` (scripted installs) or asks for it at
-a hidden prompt, and says so plainly when there is neither.
+the installer uses `ZIM_CLAUDE_TOKEN` when it is set, otherwise the public key in
+`config/token`, and only falls back to a hidden prompt if both are absent.
 
 It also repairs a profile that points at a port which **rejects its own token**. That
 happens when another LiteLLM — ZimZilla's, a leftover install — already owns the port
@@ -672,12 +672,14 @@ on that directory and on the model name, so a rename in one place cannot silentl
 from the others. Note that `start-litellm.sh`'s `help` reads its own header with
 `sed -n '2,9p'`, so its comment block must stay on lines 2–9.
 
-**No credential is tracked in this repo.** The Token Juice key lives in
-`~/tokenjuice/source` (mode 600), outside the checkout, and `install.sh` never writes a
-secret into it. A scripted install supplies the key through `ZIM_CLAUDE_TOKEN`; an
-interactive one asks for it with the input hidden. `tests/run-tests.sh` fails the suite
-if a `tj_…`/`lfu_…`/`thk_…` key ever appears in a tracked file, so a key pasted into a
-config by accident is caught before it is committed rather than after it is pushed.
+**The key in `config/token` is public on purpose.** It is a shared Token Juice key,
+committed so a fresh install loads it instead of prompting; the profile at
+`~/tokenjuice/source` (mode 600) is a copy of it, outside the checkout, and
+`install.sh` never writes a secret into the repo. A scripted install can supply a
+different key through `ZIM_CLAUDE_TOKEN`, and an existing profile is never overwritten.
+`tests/run-tests.sh` allows only that one shipped key and fails the suite if any other
+`tj_…`/`lfu_…`/`thk_…` key appears in a tracked file, so an accidental paste is caught
+before it is committed rather than after it is pushed.
 
 **Line endings are pinned in `.gitattributes`.** Git for Windows defaults to
 `core.autocrlf=true`, which would rewrite the bash scripts on checkout and make their

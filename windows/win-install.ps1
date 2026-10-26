@@ -315,15 +315,26 @@ function Select-ProxyPort {
 function Install-EnvProfile {
   Invoke-Step "mkdir $TokenJuiceDir" { New-Item -ItemType Directory -Force -Path $TokenJuiceDir | Out-Null }
 
-  # No credential ships in this checkout. The key comes from ZIM_CLAUDE_TOKEN for
-  # a scripted install, or from a prompt further down. Trims surrounding
-  # whitespace, including the CR a browser copy-paste adds - a trailing CR inside
-  # the export produces a 401 that looks like a bad key.
+  # The key comes from ZIM_CLAUDE_TOKEN for a scripted install, or from the
+  # public key shipped in config/token. A prompt is only the last resort, for a
+  # checkout whose config/token was removed. Trims surrounding whitespace,
+  # including the CR a browser copy-paste adds - a trailing CR inside the export
+  # produces a 401 that looks like a bad key.
   $token = ''
   $src = ''
   if ($env:ZIM_CLAUDE_TOKEN) {
     $token = ($env:ZIM_CLAUDE_TOKEN -replace '\s', '')
     $src = 'ZIM_CLAUDE_TOKEN'
+  }
+
+  # No key on the command line: load the public key that ships with this
+  # checkout, so a fresh install never stops to ask.
+  if ([string]::IsNullOrEmpty($token)) {
+    $shippedToken = Join-Path $SrcDir 'config\token'
+    if (Test-Path -LiteralPath $shippedToken) {
+      $token = ((Get-Content -LiteralPath $shippedToken -Raw -ErrorAction SilentlyContinue) -replace '\s', '')
+      if (-not [string]::IsNullOrEmpty($token)) { $src = $shippedToken }
+    }
   }
 
   $port = 0
@@ -373,7 +384,7 @@ function Install-EnvProfile {
 
   if ([string]::IsNullOrEmpty($token)) {
     if ($DryRun) {
-      Write-Host "    would ask for a Token Juice key (none ships in the repo)"
+      Write-Host "    would ask for a Token Juice key (config\token is missing or empty)"
       return $true
     }
     # Nothing to install from and no credential in the profile: ask for one.
@@ -388,8 +399,8 @@ function Install-EnvProfile {
     $src = 'the key you typed'
     if ([string]::IsNullOrEmpty($token)) {
       Write-Err "no Token Juice key available."
-      Write-Err "  either set ZIM_CLAUDE_TOKEN=tj_... and re-run, or create"
-      Write-Err "  $EnvFile by hand:"
+      Write-Err "  either restore config\token, set ZIM_CLAUDE_TOKEN=tj_... and"
+      Write-Err "  re-run, or create $EnvFile by hand:"
       Write-Err "    export ANTHROPIC_AUTH_TOKEN=`"tj_...`""
       return $false
     }
