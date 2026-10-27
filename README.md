@@ -469,8 +469,39 @@ Then, in Claude Desktop:
 
 4. **Apply Changes** (older builds: *Apply locally*), then **restart Claude Desktop**.
 
-The picker now lists `claude-opus-5-5`, and every Cowork, Chat and Code model call goes
-through LiteLLM.
+The picker now lists the gateway's models — Token Juice and Logfare side by side — and
+every Cowork, Chat and Code model call goes through LiteLLM.
+
+### Switching provider from the model picker
+
+Both upstreams live behind the same gateway, so changing provider is a pick in the model
+menu, not a settings edit and a restart:
+
+| Picker entry | Upstream |
+|---|---|
+| `claude-opus-5-5` | Token Juice → DeepSeek-V4.1-Flash |
+| `claude-opus-5-5-logfare` | Logfare → DeepSeek-V4.1-Flash |
+| `claude-opus-5-5-logfare-pro` | Logfare → DeepSeek-V4-Pro |
+| `claude-opus-5-5-glm` | Logfare → GLM-5.3 |
+| `claude-opus-5-5-kimi` | Logfare → Kimi-K2.6 |
+
+Claude Desktop removes any model name that does not look like an Anthropic model, which
+is why every entry is spelled `claude-*` even when a DeepSeek model answers behind it.
+
+The Logfare key is not a second thing to configure: both proxy launchers read
+`~/.config/zim-claude/logfare` (the same file `zim-claude` uses for its Logfare route)
+and export it as `LOGFARE_API_KEY`. Without that key the `*-logfare*` entries answer 500
+on use and the Token Juice entry keeps working.
+
+To add a model, copy one `model_name` block in `litellm-config.desktop.yaml`, point
+`model:` at the upstream id, and `start-desktop-proxy.sh restart`. What the key can use
+is listed by `curl -s https://logfare.ai/v1/models -H "Authorization: Bearer <key>"`
+(keep only entries with `premium_unlocked` and `chat_capabilities.tools`).
+
+Give every new entry a `model_info.max_input_tokens` from that catalog (`context_length`);
+Token Juice's catalog uses `context_window` instead. LiteLLM guesses otherwise — it
+reported 1,000,000 for the Token Juice model until the entry said 262144 — and the app's
+context gauge is measured against that number.
 
 <details>
 <summary><b>No-click alternative (managed config, Linux only)</b></summary>
@@ -487,6 +518,29 @@ show a *managed configuration* notice — that is expected.
 Windows, use the in-app dialog above.
 
 </details>
+
+> **This checkout is a fork.** `origin` is the maintainer's fork, not
+> `Mr-Destroyer/zim-claude` — the two histories diverged, and pointing the
+> updater at upstream would abort with `has diverged`. Upstream changes reach
+> this fork as a squash diff of the upstream tree against this tree, so nothing
+> here is lost; plain rebases and merges do not work.
+
+### Switching provider when one upstream misbehaves
+
+Both upstreams sit behind the same CLI proxy, and `zim-claude` already asks for
+whatever model you pick in its start-up menu. To move a whole CLI session to Logfare:
+
+1. `./install.sh` once — it adds the `logfare/*` entries to `~/tokenjuice/litellm-config.yaml`
+   (existing entries are untouched; a config you hand-edited is only reported, not changed).
+2. `start-litellm.sh restart`, then pick `logfare/...` in the `zim-claude` model menu.
+
+Inside a running Claude Code session `/model` only accepts Claude Code's own tier names, and
+those are pinned to the model chosen at launch — so a mid-session switch means a restart of
+`zim-claude`, not just `/model`.
+
+The Logfare key is not a second file: `start-litellm.sh` reads `~/.config/zim-claude/logfare`
+(the same profile `zim-claude` uses for its direct Logfare route) and exports it as
+`LOGFARE_API_KEY`. Without it the `logfare/*` models answer 500 and Token Juice keeps working.
 
 ### Desktop gateway configuration
 

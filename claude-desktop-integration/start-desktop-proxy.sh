@@ -97,12 +97,27 @@ do_start() {
   set -a; . "$ENV_FILE"; set +a
   export CLAUDE_DESKTOP_LITELLM_KEY="$GATEWAY_KEY"
 
+  # Second upstream: the logfare/* entries read LOGFARE_API_KEY, taken from the
+  # CLI's Logfare profile so one key file serves both routes. LOGFARE_API_KEY
+  # is deliberately left out of the check below — a missing key only breaks
+  # the logfare/* models, and the Token Juice ones must still start.
+  local logfare_profile="${LOGFARE_PROFILE:-$HOME/.config/zim-claude/logfare}"
+  if [[ -z "${LOGFARE_API_KEY:-}" && -r "$logfare_profile" ]]; then
+    local _k
+    _k="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?ANTHROPIC_AUTH_TOKEN[[:space:]]*=[[:space:]]*//p' "$logfare_profile" \
+          | tail -n 1 | sed -e 's/^["'\'']//' -e 's/["'\'']*[[:space:]]*\(#.*\)\?$//')"
+    [[ -n "$_k" ]] && export LOGFARE_API_KEY="$_k"
+    unset _k
+  fi
+  [[ -z "${LOGFARE_API_KEY:-}" ]] && log "no Logfare key in $logfare_profile — logfare models will fail on use"
+
   # Verify every os.environ/<VAR> the config references is now set.
   local missing=0 var
   while IFS= read -r var; do
     [[ -z "$var" ]] && continue
     [[ -n "${!var:-}" ]] || { err "required env var '$var' is unset after sourcing $ENV_FILE"; missing=1; }
-  done < <(grep -oE 'os\.environ/[A-Za-z_][A-Za-z0-9_]*' "$CONFIG" 2>/dev/null | sed 's|os\.environ/||' | sort -u)
+  done < <(grep -oE 'os\.environ/[A-Za-z_][A-Za-z0-9_]*' "$CONFIG" 2>/dev/null \
+             | sed 's|os\.environ/||' | grep -v '^LOGFARE_API_KEY$' | sort -u)
   (( missing )) && exit 1
 
   log "starting proxy on :$PORT  (config: $CONFIG)"

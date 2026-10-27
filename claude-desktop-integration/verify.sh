@@ -29,6 +29,13 @@ echo "$body" | grep -q 'claude' \
   && pass "picker will show claude-* model(s)" \
   || fail "no claude/anthropic-named model — Claude Desktop would reject the deployment"
 
+# Every model the gateway advertises, not just the default one: a config entry
+# whose upstream or key is wrong fails here and nowhere else before the app
+# shows it in the picker.
+mapfile -t MODELS < <(printf '%s' "$body" | grep -o '"id": *"[^"]*"' | sed 's/.*"\([^"]*\)"/\1/')
+(( ${#MODELS[@]} )) || MODELS=("$MODEL")
+
+for MODEL in "${MODELS[@]}"; do
 hdr "3. Anthropic Messages API (POST $BASE/v1/messages, model=$MODEL)"
 code="$(curl -s -o /tmp/_verify_msg.json -w '%{http_code}' -X POST "$BASE/v1/messages" \
   -H "content-type: application/json" \
@@ -42,6 +49,7 @@ else
   fail "HTTP $code"
   head -c 600 /tmp/_verify_msg.json; echo
 fi
+done
 
 cat <<EOF
 
