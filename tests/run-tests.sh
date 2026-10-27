@@ -134,10 +134,18 @@ if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
   fail "no other live API key is committed" "$hits"
 else pass "no other live API key is committed"; fi
 
-# The Token Juice route replaced two earlier providers. Neither may creep back in.
-if hits="$(grep -rniE 'logfare|tokenharbor' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no Logfare/TokenHarbor leftovers" "$hits"
-else pass "no Logfare/TokenHarbor leftovers"; fi
+# TokenHarbor is retired and must not creep back in. Logfare is a *supported*
+# provider again (the start-up menu offers it), so only its credential is
+# forbidden here — the key lives in ~/.config/zim-claude/logfare, never in the
+# repo, and a live one leaking into a commit is the actual failure mode.
+if hits="$(grep -rniE 'tokenharbor' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
+  fail "no TokenHarbor leftovers" "$hits"
+else pass "no TokenHarbor leftovers"; fi
+
+if hits="$(grep -rnE 'ANTHROPIC_AUTH_TOKEN[[:space:]]*=[[:space:]]*["'"'"']?[A-Za-z0-9_-]{24,}' "$REPO" \
+             --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
+  fail "no Logfare key is committed" "$hits"
+else pass "no Logfare key is committed"; fi
 
 # ------------------------------------------------------------- windows ------
 
@@ -1023,6 +1031,75 @@ if grep -q 'zim-claude-update.ps1' "$REPO/windows/zim-claude.ps1"; then
   pass "windows wrapper references the updater"
 else fail "windows wrapper does not reference the updater"; fi
 
+# --------------------------------------------------------- provider choice ---
+
+section "provider switching"
+
+# Both routes live behind one proxy, so the configs must name every Logfare
+# model the pickers offer, under a name each app accepts.
+for cfg in "$REPO/config/litellm-config.yaml" "$REPO/claude-desktop-integration/litellm-config.desktop.yaml"; do
+  name="${cfg#"$REPO"/}"
+  if grep -qF 'api_base: https://logfare.ai' "$cfg" && grep -qF 'os.environ/LOGFARE_API_KEY' "$cfg"; then
+    pass "$name carries the Logfare upstream"
+  else fail "$name has no Logfare upstream"; fi
+done
+
+# Claude Desktop silently drops any model whose name lacks claude/anthropic.
+bad="$(sed -n 's/^  - model_name: \([^[:space:]]*\).*/\1/p' \
+        "$REPO/claude-desktop-integration/litellm-config.desktop.yaml" \
+        | grep -viE 'claude|anthropic' || true)"
+if [[ -z "$bad" ]]; then pass "every desktop model name looks Anthropic-shaped"
+else fail "desktop config has names the app would drop" "$bad"; fi
+
+if grep -q 'enabled_providers: \["openai", "anthropic"\]' "$REPO/claude-desktop-integration/litellm-config.desktop.yaml"; then
+  pass "web-search interception covers both providers"
+else fail "web-search interception misses one provider"; fi
+
+# The proxy launchers must read the key from the one profile the CLI uses,
+# and a missing key must not stop the proxy from starting.
+for s in "$REPO/scripts/start-litellm.sh" "$REPO/claude-desktop-integration/start-desktop-proxy.sh"; do
+  name="${s#"$REPO"/}"
+  grep -qF '.config/zim-claude/logfare' "$s" && grep -qF 'export LOGFARE_API_KEY' "$s" \
+    && pass "$name reads the Logfare key" || fail "$name does not read the Logfare key"
+done
+if sed -n '/Verify every os.environ/,/done <</p' "$REPO/claude-desktop-integration/start-desktop-proxy.sh" | grep -q "grep -v '\^LOGFARE_API_KEY\$'"; then
+  pass "a missing Logfare key does not block the desktop proxy"
+else fail "the desktop proxy dies without a Logfare key"; fi
+
+# Every entry declares its real context window: LiteLLM falls back to a guessed
+# size otherwise, and the Token Juice model is 262144, not the 1M it reported.
+missing="$(python3 - "$REPO/config/litellm-config.yaml" \
+                     "$REPO/claude-desktop-integration/litellm-config.desktop.yaml" <<'PY'
+import sys, yaml
+for path in sys.argv[1:]:
+    for m in yaml.safe_load(open(path))["model_list"]:
+        info = m.get("model_info") or {}
+        if not info.get("max_input_tokens"):
+            print(f"{path.rsplit('/', 2)[-2]}/{path.rsplit('/', 1)[-1]}: {m['model_name']}")
+PY
+)"
+if [[ -z "$missing" ]]; then pass "every model declares max_input_tokens"
+else fail "models without a declared context window" "$missing"; fi
+
+# install.sh only appends the block to a config it still recognises, and
+# never rewrites the entries already there.
+old="$SBX/old-config.yaml"
+sed -n '/^general_settings:/,/^  - model_name: deepseek-v4.1-flash-1017/p' "$REPO/config/litellm-config.yaml" >"$old"
+printf '      api_base: https://api.tokenjuice.ai/v1\n      api_key: os.environ/ANTHROPIC_AUTH_TOKEN\n      drop_params: true\n' >>"$old"
+mig() {
+  bash -c 'SRC_DIR=$1; CONFIG_FILE=$2; say(){ echo "SAY $*"; }; warn(){ echo "WARN $*"; }
+           backup_if_exists(){ :; }
+           '"$(sed -n '/^add_missing_logfare_models() {/,/^}/p' "$REPO/install.sh")"'
+           add_missing_logfare_models' _ "$REPO" "$old"
+}
+mig_out="$(mig 2>&1)"
+assert_contains "installer appends Logfare models to an old config" "adding the Logfare models" "$mig_out"
+mig_again="$(mig 2>&1)"
+assert_eq "a second run touches nothing" "" "$mig_again"
+assert_eq "old config now lists five models" 5 \
+  "$(grep -c 'model_name:' "$old")"
+assert_eq "installer leaves the old model entry alone" 1 \
+  "$(grep -c 'model_name: deepseek-v4.1-flash-1017' "$old")"
 # ---------------------------------------------------------------- summary ---
 
 printf '\n%s== summary%s\n' "$c_b" "$c_0"

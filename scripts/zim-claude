@@ -6,6 +6,9 @@
 # `zim-claude -p "..."` and every other Claude Code flag/subcommand must reach
 # claude unchanged. Configure this script through environment variables only.
 #
+#   ZIM_CLAUDE_PROVIDER       tokenjuice | logfare (skips the start-up menu)
+#   ZIM_CLAUDE_PROVIDER_FILE  remembers the last choice (default ~/.config/zim-claude/provider)
+#   LOGFARE_ENV_FILE          Logfare profile to source (default ~/.config/zim-claude/logfare)
 #   LITELLM_ENV_FILE          profile to source   (default ~/tokenjuice/source)
 #   LITELLM_PORT              proxy port         (default: the port in the profile)
 #   LITELLM_LOG               proxy log path     (default /tmp/litellm-proxy.log)
@@ -15,9 +18,17 @@
 #   ZIM_CLAUDE_REQUIRE_PROXY=1  hard-fail if the proxy is not healthy
 #   ZIM_CLAUDE_NO_UPDATE=1    never auto-update
 #
-# The profile and the model-name config both live in the Token Juice directory
-# (${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}) — one shared route, not a
-# private copy.
+# Two upstreams are supported and the start-up menu picks between them:
+#
+#   tokenjuice  LiteLLM proxy on :4000. Token Juice only speaks OpenAI, so the
+#               proxy translates Anthropic /v1/messages for it.
+#   logfare     https://logfare.ai direct. Logfare serves Anthropic Messages
+#               natively, so no proxy is involved and none is started.
+#
+# The Token Juice profile and the model-name config both live in the Token Juice
+# directory (${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}) — one shared route,
+# not a private copy. The Logfare profile lives beside this machine's other
+# zim-claude state, in ~/.config/zim-claude/logfare.
 
 set -euo pipefail
 
@@ -26,6 +37,18 @@ set -euo pipefail
 _self_dir="$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)"
 
 TOKENJUICE_DIR="${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}"
+
+# Machine-local state: the remembered provider choice and the Logfare profile.
+CONFIG_DIR="${ZIM_CLAUDE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/zim-claude}"
+PROVIDER_FILE="${ZIM_CLAUDE_PROVIDER_FILE:-$CONFIG_DIR/provider}"
+LOGFARE_ENV_FILE="${LOGFARE_ENV_FILE:-$CONFIG_DIR/logfare}"
+
+# Logfare is OpenAI-compatible *and* Anthropic-compatible; Claude Code talks
+# Anthropic natively, so it points straight at the service with no proxy.
+LOGFARE_BASE_URL="${LOGFARE_BASE_URL:-https://logfare.ai}"
+# Fallback only. The profile's own ANTHROPIC_MODEL wins when it sets one, so
+# editing ~/.config/zim-claude/logfare is enough to change model.
+LOGFARE_MODEL="${LOGFARE_MODEL:-gpt-5-mini}"
 
 LITELLM_ENV_FILE="${LITELLM_ENV_FILE:-$TOKENJUICE_DIR/source}"
 # Kept separate so "not set" can mean "follow the profile". The installer picks
@@ -57,28 +80,336 @@ info() { printf '\033[36m[zim-claude]\033[0m %s\n' "$*" >&2; }
 [[ -x "$CLAUDE_BIN" ]] \
   || die "claude is not executable: $CLAUDE_BIN"
 
-# Fail CLOSED. Without the profile, claude would silently use whatever
+# Fail CLOSED. Without a profile, claude would silently use whatever
 # ANTHROPIC_* the user's shell already exports — a session against the wrong
-# provider, with the wrong model, and no indication anything was off.
-[[ -r "$LITELLM_ENV_FILE" ]] \
-  || die "env file not found or unreadable: $LITELLM_ENV_FILE
-       Refusing to run: without it, claude would silently use whatever
-       ANTHROPIC_* variables your shell already exports.
-       Fix:  LITELLM_ENV_FILE=/path/to/profile zim-claude ...
-       or re-run install.sh."
+# provider, with the wrong model, and no indication anything was off. Which
+# profile that is gets decided by the provider menu below.
+
+# --- provider menu -----------------------------------------------------------
+
+# Read the key out of a Logfare profile without sourcing it: sourcing would
+# export a stale ANTHROPIC_BASE_URL before we have decided anything.
+logfare_key() { profile_var "$LOGFARE_ENV_FILE" ANTHROPIC_AUTH_TOKEN; }
+
+logfare_ready() { [[ -n "$(logfare_key)" ]]; }
+
+# profile_var <file> <NAME> — one assignment out of a shell profile, without
+# sourcing it. Sourcing would export a stale ANTHROPIC_BASE_URL before the
+# provider has been decided, and would run anything else the file contains.
+profile_var() {
+  local file="$1" name="$2"
+  [[ -r "$file" ]] || return 0
+  sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}${name}[[:space:]]*=[[:space:]]*[\"']\{0,1\}\([^\"']*\)[\"']\{0,1\}[[:space:]]*\$/\2/p" \
+    "$file" | head -n 1
+}
+
+# logfare_context <model-id> — that model's context window from Logfare's
+# catalog, or nothing. Best effort: an unreachable catalog must not block a
+# session, so every failure path returns an empty string and the caller keeps
+# Claude Code's own default.
+logfare_context() {
+  local model="$1" key body
+  key="$(logfare_key)"
+  [[ -n "$key" && -n "$model" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  body="$(curl -sS --max-time 8 \
+            -H "Authorization: Bearer $key" \
+            -H 'Accept: application/json' \
+            "$LOGFARE_BASE_URL/v1/models" 2>/dev/null)" || return 0
+  printf '%s' "$body" | python3 -I -c '
+import json, sys
+want = sys.argv[1]
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in data.get("data", []):
+    if m.get("id") == want:
+        n = m.get("context_length")
+        if isinstance(n, int) and n > 0:
+            print(n)
+        break
+' "$model" 2>/dev/null
+}
+
+# logfare_models — chat models this key can actually use, one per line as
+# "<id>\t<context>". Two fields are filtered and both matter:
+#   premium_unlocked — otherwise the request answers 403 training_optin_required
+#   tools            — Claude Code cannot work against a model without tool use
+logfare_models() {
+  local key body
+  key="$(logfare_key)"
+  [[ -n "$key" ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  body="$(curl -sS --max-time 8 \
+            -H "Authorization: Bearer $key" \
+            -H 'Accept: application/json' \
+            "$LOGFARE_BASE_URL/v1/models" 2>/dev/null)" || return 0
+  printf '%s' "$body" | python3 -I -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for m in data.get("data", []):
+    if not m.get("premium_unlocked"):
+        continue
+    eps = m.get("endpoints") or []
+    if isinstance(eps, dict):
+        eps = list(eps.keys())
+    if "chat/completions" not in eps:
+        continue
+    if not (m.get("chat_capabilities") or {}).get("tools"):
+        continue
+    print("%s\t%s" % (m.get("id", ""), m.get("context_length") or 0))
+' 2>/dev/null
+}
+
+# tokenjuice_models — the aliases the local proxy knows, one per line as
+# "<name>\t0". The proxy only accepts model_name entries from its config, so
+# the upstream catalog is not what to list here.
+tokenjuice_models() {
+  local cfg="${LITELLM_CONFIG:-$TOKENJUICE_DIR/litellm-config.yaml}"
+  [[ -r "$cfg" ]] || return 0
+  sed -n 's/^[[:space:]]*-[[:space:]]*model_name:[[:space:]]*\([^[:space:]#]*\).*/\1/p' "$cfg" \
+    | while IFS= read -r n; do printf '%s\t0\n' "$n"; done
+}
+
+# fmt_ctx 400000 -> "400K", 1048576 -> "1M", 0 -> ""
+fmt_ctx() {
+  local n="${1:-0}"
+  (( n > 0 )) || return 0
+  if (( n >= 1000000 )); then printf '%sM' "$(( n / 1000000 ))"
+  else printf '%sK' "$(( n / 1000 ))"; fi
+}
+
+# remembered_model <provider> — the model picked last time, or nothing.
+remembered_model() {
+  local f="$CONFIG_DIR/model-$1"
+  [[ -r "$f" ]] || return 0
+  tr -d ' \t\r\n' <"$f" 2>/dev/null || true
+}
+
+# model_menu <provider> <default> — show the provider's models and print the
+# chosen id. Returns 1 when there is nothing to choose from, so the caller keeps
+# the model it already has.
+model_menu() {
+  local provider="$1" default="$2" rows=()
+  local remembered_file="$CONFIG_DIR/model-$provider"
+
+  if [[ -r "$remembered_file" ]]; then
+    local remembered
+    remembered="$(tr -d ' \t\r\n' <"$remembered_file" 2>/dev/null || true)"
+    [[ -n "$remembered" ]] && default="$remembered"
+  fi
+
+  if [[ "$provider" == "logfare" ]]; then
+    mapfile -t rows < <(logfare_models)
+  else
+    mapfile -t rows < <(tokenjuice_models)
+  fi
+
+  local ids=() ctxs=()
+  local row
+  for row in "${rows[@]}"; do
+    [[ -n "$row" ]] || continue
+    ids+=("${row%%$'\t'*}")
+    ctxs+=("${row##*$'\t'}")
+  done
+  (( ${#ids[@]} > 0 )) || return 1
+
+  # Nothing to pick, or nowhere to ask: keep the caller's model.
+  (( ${#ids[@]} > 1 )) || { printf '%s\n' "${ids[0]}"; return 0; }
+  [[ -t 0 && -t 2 ]] || { printf '%s\n' "$default"; return 0; }
+
+  local default_n=1 i
+  for i in "${!ids[@]}"; do
+    [[ "${ids[$i]}" == "$default" ]] && default_n=$((i + 1))
+  done
+
+  printf '\n' >&2
+  printf '\033[36m[zim-claude]\033[0m model for %s\n' "$provider" >&2
+  for i in "${!ids[@]}"; do
+    printf '  %2d) %-28s %s\n' "$((i + 1))" "${ids[$i]}" "$(fmt_ctx "${ctxs[$i]}")" >&2
+  done
+
+  local answer
+  while :; do
+    printf '  choice [%d]: ' "$default_n" >&2
+    IFS= read -r answer || answer=""
+    answer="$(printf '%s' "$answer" | tr -d ' \t\r\n')"
+    [[ -z "$answer" ]] && answer="$default_n"
+    if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#ids[@]} )); then
+      mkdir -p -- "$CONFIG_DIR" 2>/dev/null || true
+      printf '%s\n' "${ids[$((answer - 1))]}" >"$remembered_file" 2>/dev/null || true
+      printf '%s\n' "${ids[$((answer - 1))]}"
+      return 0
+    fi
+    warn "not an option: $answer"
+  done
+}
+
+provider_label() {
+  case "$1" in
+    tokenjuice) printf 'Token Juice  (proxy :%s, %s)' "$LITELLM_PORT" "${_zim_tj_model:-$(profile_var "$LITELLM_ENV_FILE" ANTHROPIC_MODEL)}" ;;
+    logfare)    printf 'Logfare      (%s direct, %s)' "$LOGFARE_BASE_URL" "${_zim_lf_model:-$(profile_var "$LOGFARE_ENV_FILE" ANTHROPIC_MODEL)}" ;;
+  esac
+}
+
+# chosen_provider — decide where this session runs.
+#
+# Precedence: explicit ZIM_CLAUDE_PROVIDER wins outright. Otherwise, on a TTY,
+# always show the menu with the remembered choice as its default — remembering
+# is a convenience, never a lock-in, so switching provider must not require
+# editing files. Without a TTY (pipelines, cron) fall back to the remembered
+# choice and then to tokenjuice, so unattended runs never block on a prompt.
+chosen_provider() {
+  local choice="${ZIM_CLAUDE_PROVIDER:-}"
+  local remembered=""
+  [[ -r "$PROVIDER_FILE" ]] && remembered="$(head -n 1 "$PROVIDER_FILE" 2>/dev/null | tr -d '[:space:]')"
+
+  if [[ -z "$choice" ]] && [[ -t 0 ]] && [[ -t 2 ]]; then
+    local tj_state lf_state default
+    tj_state="$(provider_label tokenjuice)"
+    if logfare_ready; then lf_state="$(provider_label logfare)"; else lf_state="Logfare      (no key yet — $LOGFARE_ENV_FILE)"; fi
+    case "$remembered" in
+      logfare) default=2 ;;
+      *)       default=1 ;;
+    esac
+
+    {
+      printf '\033[36m[zim-claude]\033[0m which token?\n'
+      printf '  1) %s\n' "$tj_state"
+      printf '  2) %s\n' "$lf_state"
+      printf '  choice [%s]: ' "$default"
+    } >&2
+    local answer
+    read -r answer || answer=""
+    case "${answer:-$default}" in
+      1|tj|tokenjuice) choice="tokenjuice" ;;
+      2|lf|logfare)    choice="logfare" ;;
+      *)               die "unrecognised choice: $answer (expected 1 or 2)" ;;
+    esac
+  fi
+
+  printf '%s\n' "${choice:-${remembered:-tokenjuice}}"
+}
+
+ZIM_CLAUDE_PROVIDER="$(chosen_provider)"
+
+case "$ZIM_CLAUDE_PROVIDER" in
+  tokenjuice|logfare) ;;
+  *) die "unknown ZIM_CLAUDE_PROVIDER='$ZIM_CLAUDE_PROVIDER' (expected tokenjuice or logfare)" ;;
+esac
+
+# Remember the choice, but only when it was made interactively and can actually
+# be used — remembering a provider whose key is missing would make the next
+# start-up default to a route that dies on the spot.
+if [[ -t 0 && -t 2 ]]; then
+  _zim_remember=1
+  [[ "$ZIM_CLAUDE_PROVIDER" == "logfare" ]] && ! logfare_ready && _zim_remember=0
+  if [[ "$_zim_remember" == "1" ]]; then
+    mkdir -p -- "$(dirname -- "$PROVIDER_FILE")" 2>/dev/null || true
+    if [[ "$(head -n 1 "$PROVIDER_FILE" 2>/dev/null)" != "$ZIM_CLAUDE_PROVIDER" ]]; then
+      printf '%s\n' "$ZIM_CLAUDE_PROVIDER" >"$PROVIDER_FILE" 2>/dev/null || true
+    fi
+  fi
+  unset _zim_remember
+fi
 
 # --- load the profile --------------------------------------------------------
 
 # Captured BEFORE `set -a`, so this bookkeeping var is not itself exported.
 _zim_prev_base_url="${ANTHROPIC_BASE_URL:-}"
 
-set -a
-# shellcheck disable=SC1090
-. "$LITELLM_ENV_FILE"
-set +a
+if [[ "$ZIM_CLAUDE_PROVIDER" == "logfare" ]]; then
+  logfare_ready || die "no Logfare key in $LOGFARE_ENV_FILE
+       Put your key there:
+           ANTHROPIC_AUTH_TOKEN=\"your-logfare-key\"
+       then run zim-claude again, or pick Token Juice in the menu.
+       (A free key comes from https://logfare.ai/register)"
 
-[[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] \
-  || die "$LITELLM_ENV_FILE did not set ANTHROPIC_AUTH_TOKEN — refusing to start."
+  # Clear the Token Juice profile's variables first: they may be inherited from
+  # the shell, and a stale ANTHROPIC_SMALL_FAST_MODEL would point Logfare at a
+  # model it does not have.
+  unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_MODEL \
+        ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+        ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL
+
+  # Model precedence: ZIM_CLAUDE_MODEL, then the profile's own ANTHROPIC_MODEL,
+  # then the model picked last time, then the built-in default. The profile wins
+  # over the remembered pick so editing ~/.config/zim-claude/logfare always
+  # takes effect; the menu overrides it for this session and remembers.
+  _zim_lf_model="${ZIM_CLAUDE_MODEL:-$(profile_var "$LOGFARE_ENV_FILE" ANTHROPIC_MODEL)}"
+  _zim_lf_model="${_zim_lf_model:-$(remembered_model logfare)}"
+  _zim_lf_model="${_zim_lf_model:-$LOGFARE_MODEL}"
+
+  # Interactive model picker. ZIM_CLAUDE_NO_MODEL_MENU=1 or a non-TTY session
+  # keeps the model above without asking.
+  if [[ "${ZIM_CLAUDE_NO_MODEL_MENU:-0}" != "1" && -t 0 && -t 2 ]]; then
+    _zim_picked="$(model_menu logfare "$_zim_lf_model")" || _zim_picked=""
+    [[ -n "$_zim_picked" ]] && _zim_lf_model="$_zim_picked"
+    unset _zim_picked
+  fi
+
+  set -a
+  ANTHROPIC_AUTH_TOKEN="$(logfare_key)"
+  ANTHROPIC_BASE_URL="$LOGFARE_BASE_URL"
+  ANTHROPIC_MODEL="$_zim_lf_model"
+  set +a
+
+  # Claude Code >= 2.1.169 always sends thinking:{"type":"adaptive"}. Logfare
+  # forwards that to an upstream that rejects it, and the whole request dies as
+  # a bare "400 Upstream request failed with HTTP 400" — measured: the same
+  # request minus that one field returns 200. LiteLLM's drop_anthropic_only
+  # callback exists for exactly this reason on the Token Juice route; on this
+  # route the supported switch is the one below. Without it every turn fails.
+  export CLAUDE_CODE_DISABLE_THINKING=1
+
+  # Context length comes from Logfare's catalog: Claude Code does not know
+  # these models and would assume a 200K window otherwise. One catalog fetch
+  # per launch, skipped when the model is not in it.
+  _zim_lf_ctx="$(logfare_context "$_zim_lf_model")"
+  if [[ "$_zim_lf_ctx" =~ ^[0-9]+$ ]] && (( _zim_lf_ctx > 0 )); then
+    export CLAUDE_CODE_MAX_CONTEXT_TOKENS="$_zim_lf_ctx"
+  fi
+  unset _zim_lf_ctx
+
+  # Logfare speaks Anthropic natively: no proxy, nothing to start or check.
+  ZIM_CLAUDE_NO_PROXY=1
+else
+  [[ -r "$LITELLM_ENV_FILE" ]] \
+    || die "env file not found or unreadable: $LITELLM_ENV_FILE
+       Refusing to run: without it, claude would silently use whatever
+       ANTHROPIC_* variables your shell already exports.
+       Fix:  LITELLM_ENV_FILE=/path/to/profile zim-claude ...
+       or re-run install.sh."
+
+  set -a
+  # shellcheck disable=SC1090
+  . "$LITELLM_ENV_FILE"
+  set +a
+
+  [[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ]] \
+    || die "$LITELLM_ENV_FILE did not set ANTHROPIC_AUTH_TOKEN — refusing to start."
+
+  # Interactive model picker over the proxy's aliases. The proxy rejects any
+  # name that is not a model_name in its config, so the list comes from that
+  # config and not from the upstream catalog.
+  if [[ "${ZIM_CLAUDE_NO_MODEL_MENU:-0}" != "1" && -t 0 && -t 2 ]]; then
+    _zim_picked="$(model_menu tokenjuice "${ANTHROPIC_MODEL:-$(remembered_model tokenjuice)}")" || _zim_picked=""
+    if [[ -n "$_zim_picked" ]]; then
+      export ANTHROPIC_MODEL="$_zim_picked"
+      # Tiers were derived from the old model; redo them from the new one.
+      unset ANTHROPIC_SMALL_FAST_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+            ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL
+    fi
+    unset _zim_picked
+  elif [[ -z "${ANTHROPIC_MODEL:-}" ]]; then
+    # Non-interactive: fall back to the remembered pick, then the profile.
+    ANTHROPIC_MODEL="$(remembered_model tokenjuice)"
+  fi
+fi
 
 # Claude Code names its background and /model-picker calls after Anthropic tiers
 # (haiku / sonnet / opus). The proxy only knows the model names in
@@ -97,6 +428,15 @@ if [[ -n "$_zim_prev_base_url" && "$_zim_prev_base_url" != "${ANTHROPIC_BASE_URL
   warn "overriding inherited ANTHROPIC_BASE_URL=$_zim_prev_base_url -> ${ANTHROPIC_BASE_URL:-}"
 fi
 
+# One line saying which route this session is on. Cheap, and it makes a wrong
+# provider choice obvious instead of showing up as a confusing 401 later.
+info "provider: $(provider_label "$ZIM_CLAUDE_PROVIDER")"
+
+# Logfare is remote: there is no local proxy to follow, start, or check.
+if [[ "$ZIM_CLAUDE_PROVIDER" == "logfare" ]]; then
+  ZIM_CLAUDE_NO_PROXY=1
+fi
+
 # --- follow the profile's port -----------------------------------------------
 
 # The profile is the single source of truth for where the proxy lives. Only an
@@ -111,6 +451,9 @@ fi
 
 # --- only manage a proxy when the profile points at the local one ------------
 
+if [[ "$ZIM_CLAUDE_PROVIDER" == "logfare" ]]; then
+  : # remote upstream: no local proxy exists, so nothing to warn about
+else
 case "${ANTHROPIC_BASE_URL:-}" in
   *"localhost:${LITELLM_PORT}"*|*"127.0.0.1:${LITELLM_PORT}"*) ;;
   *)
@@ -119,6 +462,7 @@ case "${ANTHROPIC_BASE_URL:-}" in
     ZIM_CLAUDE_NO_PROXY=1
     ;;
 esac
+fi
 
 port_answers() {
   local code
