@@ -37,3 +37,67 @@ model_list:
       model: openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
       api_base: https://api.tokenjuice.ai/v1
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
+      drop_params: true
+    # Upstream limits come from the catalogs, not from guesses:
+    #   curl -s https://api.tokenjuice.ai/v1/models   -> context_window
+    #   curl -s https://logfare.ai/v1/models          -> context_length
+    # model_info sits on the ENTRY (sibling of litellm_params); inside
+    # litellm_params LiteLLM ignores it and /v1/models reports a made-up size.
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+
+  # --- Logfare (second upstream) ---
+  # Logfare — the second upstream, on the same proxy. Logfare serves the
+  # Anthropic Messages API natively, so `anthropic/...` passes through with no
+  # translation. The key is read from ~/.config/zim-claude/logfare by
+  # start-litellm.sh and exported as LOGFARE_API_KEY; without one these entries
+  # fail on use while the Token Juice route keeps working.
+  #
+  # Claude Code >= 2.1.169 sends thinking:{"type":"adaptive"}, which Logfare
+  # forwards to an upstream that answers 400 Upstream request failed (measured:
+  # the same request without that field returns 200). On this route the
+  # supported switch is CLAUDE_CODE_DISABLE_THINKING=1, which zim-claude sets.
+  # Only the models listed here can be picked from the proxy. Claude Code's
+  # own tier names (/model opus, sonnet, haiku) are pointed at the chosen
+  # model by zim-claude at start, so no claude-* aliases are needed here —
+  # unlike the Claude Desktop config, whose picker drops every other name.
+  - model_name: logfare/deepseek-v4.1-flash-1017
+    litellm_params:
+      model: anthropic/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+
+  - model_name: logfare/deepseek-v4-pro-0813
+    litellm_params:
+      model: anthropic/deepseek-v4-pro-0813
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+
+  - model_name: logfare/glm-5.3
+    litellm_params:
+      model: anthropic/glm-5.3
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+
+  - model_name: logfare/kimi-k2.6
+    litellm_params:
+      model: anthropic/kimi-k2.6
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536

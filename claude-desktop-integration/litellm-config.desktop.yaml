@@ -10,7 +10,12 @@
 #
 # Claude Desktop imposes two hard requirements on the gateway:
 #
-#   1. Every model_name MUST look like an Anthropic/Claude model
+#   1. Every model_name MUST look like an Anthropic/Claude model.
+#      A third requirement found by testing: the `model:` line must declared
+#      as `anthropic/...` for the gateway to report the real context window
+#      in /v1/models (what the app's context indicator reads). Registered as
+#      `openai/...`, the same entry is shown with the 200K Anthropic default.
+#      That is why the Logfare entries below are `anthropic/...`.
 #      (contain "claude" or "anthropic"). Anything else is dropped
 #      from the picker with:
 #        inferenceModels: "X" is not an Anthropic model and was removed...
@@ -19,6 +24,12 @@
 #   2. drop_params: true — Cowork/Code sessions send Anthropic-only
 #      fields (cache_control, tool_reference, experimental beta
 #      headers) that a non-Anthropic upstream rejects with HTTP 400.
+#
+# Context indicator: the "context used" gauge is fed by the usage block of each
+# response, so it works on every entry. The window it is measured against comes
+# from /v1/models — each entry declares it as model_info.max_input_tokens on the
+# entry itself (not inside litellm_params, where LiteLLM silently ignores it).
+# Without it the app assumes the 200K Anthropic default.
 #
 # The api_key is read from the environment; start-desktop-proxy.sh sources the
 # profile (default ~/tokenjuice/source) so ANTHROPIC_AUTH_TOKEN holds the Token
@@ -37,6 +48,67 @@ model_list:
       api_base: https://api.tokenjuice.ai/v1
       api_key: os.environ/ANTHROPIC_AUTH_TOKEN
       drop_params: true
+    # Token Juice's own catalog says context_window 262144 for this model —
+    # not a million. Without this line LiteLLM reported 1M and the app's
+    # context gauge was three times too optimistic.
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+
+  # --- Logfare tiers --------------------------------------------------------
+  # Same proxy, second upstream: switching provider is a pick in the model
+  # menu. Logfare speaks Anthropic natively, so `anthropic/...` passes through
+  # untouched. The key comes from ~/.config/zim-claude/logfare, exported by
+  # start-desktop-proxy.sh as LOGFARE_API_KEY. If the key is missing these
+  # entries answer 500 on use and the Token Juice ones keep working — the
+  # proxy itself still starts.
+  #
+  # Names must contain "claude" — Claude Desktop drops anything else from the
+  # picker — so each Logfare model gets a claude-* alias.
+  #
+  # model_info sits on the ENTRY, not inside litellm_params: only there does
+  # the gateway report it in /v1/models, and that number is the context window
+  # the app's context gauge is measured against (without it the app assumes
+  # 200K). `anthropic/...` alone already reports 200K correctly.
+  - model_name: claude-opus-5-5-logfare
+    litellm_params:
+      model: anthropic/deepseek-v4.1-flash-1017
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+
+  - model_name: claude-opus-5-5-logfare-pro
+    litellm_params:
+      model: anthropic/deepseek-v4-pro-0813
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 1048576
+      max_output_tokens: 65536
+
+  - model_name: claude-opus-5-5-glm
+    litellm_params:
+      model: anthropic/glm-5.3
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
+
+  - model_name: claude-opus-5-5-kimi
+    litellm_params:
+      model: anthropic/kimi-k2.6
+      api_base: https://logfare.ai
+      api_key: os.environ/LOGFARE_API_KEY
+      drop_params: true
+    model_info:
+      max_input_tokens: 262144
+      max_output_tokens: 65536
 
   # --- Optional extra tiers -------------------------------------------------
   # Token Juice serves exactly one chat model, so every tier is an alias onto
@@ -57,9 +129,32 @@ model_list:
   #     api_key: os.environ/ANTHROPIC_AUTH_TOKEN
   #     drop_params: true
 
+# --- Веб-поиск -------------------------------------------------------------
+# Ни один из двух апстримов не умеет серверный веб-поиск, а Claude Desktop
+# шлёт инструмент web_search. LiteLLM перехватывает его, ищет сам через
+# локальный SearxNG и отдаёт готовые результаты — апстрим неподдерживаемый
+# инструмент не видит.
+#
+# enabled_providers обязателен: по умолчанию перехват только для bedrock.
+# Оба провайдера, которыми пользуется этот конфиг (openai и anthropic), должны
+# быть в списке — без этого запрос с web_search возвращает 400.
+search_tools:
+  - search_tool_name: local-searxng
+    litellm_params:
+      search_provider: searxng
+      api_base: http://127.0.0.1:8888
+
 litellm_settings:
   # Belt-and-braces: strip unsupported params globally too.
   drop_params: true
+  # Порядок важен: сначала наш колбэк вырезает Anthropic-only поля
+  # (`thinking` и др.), которые апстрим отвергает с 400, и только потом
+  # отрабатывает перехват веб-поиска. Для `anthropic/...`-моделей Logfare
+  # LiteLLM режет `thinking` сам, колбэк там безвреден.
+  callbacks: ["drop_anthropic_only.proxy_handler_instance", "websearch_interception"]
+  websearch_interception_params:
+    search_tool_name: local-searxng
+    enabled_providers: ["openai", "anthropic"]
 
 general_settings:
   # Value Claude Desktop sends as "Gateway API key".
