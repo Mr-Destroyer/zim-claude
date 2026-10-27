@@ -31,7 +31,8 @@ Claude Desktop also imposes two rules the proxy has to obey:
 1. **Model names must look Anthropic-shaped.** Any model whose name lacks `claude` /
    `anthropic` is dropped from the picker:
    *`inferenceModels: "X" is not an Anthropic model and was removed from the list`*.
-   So the Token Juice model is exposed as `claude-opus-5-5` (an Opus-tier name).
+   So the Token Juice model is exposed as `claude-opus-5-5` (an Opus-tier name), and
+   every Logfare model gets a `claude-opus-5-5-*` alias.
 2. **Anthropic-only fields must be tolerated.** Cowork/Code send `cache_control`,
    `tool_reference`, beta headers. The upstream is OpenAI-style, so the config sets
    `drop_params: true` to avoid HTTP 400s.
@@ -97,8 +98,30 @@ Then, in Claude Desktop:
 
 4. **Apply Changes** (older builds: *Apply locally*), then **restart Claude Desktop**.
 
-The picker now lists `claude-opus-5-5`, and every Cowork,
-Chat and Code model call goes to LiteLLM → Token Juice → DeepSeek-V4.1-Flash-1017.
+The picker now lists every model in the config — Token Juice and Logfare side by side —
+and every Cowork, Chat and Code model call goes through LiteLLM:
+
+| Picker entry | Upstream |
+|---|---|
+| `claude-opus-5-5` | Token Juice → DeepSeek-V4.1-Flash |
+| `claude-opus-5-5-logfare` | Logfare → DeepSeek-V4.1-Flash |
+| `claude-opus-5-5-logfare-pro` | Logfare → DeepSeek-V4-Pro |
+| `claude-opus-5-5-glm` | Logfare → GLM-5.3 |
+| `claude-opus-5-5-kimi` | Logfare → Kimi-K2.6 |
+
+Switching provider is therefore a pick in the model menu — no settings edit, no
+restart. The Logfare key is not configured twice: both proxy launchers read
+`~/.config/zim-claude/logfare` and export it as `LOGFARE_API_KEY`. Without that key the
+Logfare entries answer 500 on use and Token Juice keeps working.
+
+**Context indicator.** The app's context gauge is fed by the `usage` block of each
+response, which the gateway passes through from whichever upstream answered, so it works
+for all entries. The window it is measured against comes from `GET /v1/models`: entries
+registered as `anthropic/...` report their real size (1M for the DeepSeek ones, 262K for
+GLM and Kimi), while `openai/...`-registered ones fall back to the 200K Anthropic
+default. `model_info.max_input_tokens` does **not** change this — it was tried and
+ignored, which is why the Logfare entries are `anthropic/...` and the Token Juice one,
+being OpenAI-shaped upstream, still shows 200K.
 
 ### No-click alternative (managed config)
 

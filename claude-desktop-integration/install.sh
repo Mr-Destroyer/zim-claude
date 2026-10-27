@@ -125,7 +125,8 @@ $(say "Point Claude Desktop at the gateway")
          Gateway auth scheme : bearer
     4. Apply Changes (older builds: "Apply locally"), then restart Claude Desktop.
 
-  Model that will appear in the picker:  claude-opus-5-5
+  Models that will appear in the picker (switch provider from this menu):
+$(sed -n 's/^  - model_name: \(claude-[^[:space:]]*\).*/    \1/p' "$DESK_CONFIG" | sed 's/^/  /')
 
   Verify from the shell:  $DIR/verify.sh
 

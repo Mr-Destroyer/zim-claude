@@ -304,6 +304,45 @@ install_config_yaml() {
   run install -D -m 644 -- "$SRC_DIR/config/litellm-config.yaml" "$CONFIG_FILE"
 }
 
+# --- the model list, added to a config created before it existed --------------
+#
+# A config from an older release lists only the Token Juice model, so the
+# Logfare entries never reach the proxy and switching provider is impossible
+# without hand-editing YAML. The entries are appended only when "logfare" is
+# absent from the whole model list block AND the file still looks like the
+# template — anything the user restructured is left alone. Appending never
+# touches the model names already there.
+add_missing_logfare_models() {
+  local block marker="Logfare (second upstream)"
+  [[ -f "$CONFIG_FILE" ]] || return 0
+  grep -q '^  - model_name: logfare/' "$CONFIG_FILE" 2>/dev/null && return 0
+  grep -qF 'first install — yours from now on' "$CONFIG_FILE" 2>/dev/null ||
+  grep -qE '^[[:space:]]*#[[:space:]]*Logfare' "$CONFIG_FILE" 2>/dev/null ||
+  grep -q 'master_key: os.environ/ANTHROPIC_AUTH_TOKEN' "$CONFIG_FILE" 2>/dev/null || {
+    say "$CONFIG_FILE predates the Logfare models and was hand-edited — not touching it"
+    say "  add the '$marker' block from config/litellm-config.yaml to switch providers"
+    return 0
+  }
+
+  # The block runs from its header comment to the last logfare entry; the
+  # template's next block is not assumed to exist.
+  block="$(awk '/^  # --- Logfare \(second upstream\)/ {on=1}
+                on && /^  - model_name: logfare\// {p=1}
+                on && p {buf[++n]=$0; if ($0 ~ /^      drop_params: true$/) last=n}
+                on && /^  # --- / && !/Logfare/ {on=0}
+                END {if (p) for (i=1;i<=last;i++) print buf[i]}' "$SRC_DIR/config/litellm-config.yaml")"
+  [[ -n "$block" ]] || { warn "no Logfare block found in the shipped template"; return 0; }
+
+  say "adding the Logfare models to $CONFIG_FILE (existing entries untouched)"
+  backup_if_exists "$CONFIG_FILE"
+  printf '\n%s\n' "$block" >>"$CONFIG_FILE"
+  # The append lands after general_settings on older files; YAML does not care
+  # about order, so only validity is checked.
+  if ! grep -q '^model_list:' "$CONFIG_FILE"; then
+    warn "$CONFIG_FILE has no top-level model_list — check it by hand"
+  fi
+}
+
 # --- the env profile ---------------------------------------------------------
 
 # The env file is special: it holds a live credential, so it is never
@@ -949,6 +988,7 @@ install_file "$SRC_DIR/scripts/zim-claude"       "$BIN_DIR/zim-claude"       755
 install_file "$SRC_DIR/scripts/start-litellm.sh" "$BIN_DIR/start-litellm.sh" 755
 install_file "$SRC_DIR/scripts/zim-claude-update.sh" "$BIN_DIR/zim-claude-update.sh" 755
 install_config_yaml
+add_missing_logfare_models
 # A missing key is not fatal to the install: the files are in place, the user
 # just has to supply the credential. Report it with the other prerequisites
 # rather than aborting here, so PATH and the shell config still get set up.

@@ -110,6 +110,23 @@ do_start() {
   # Load the env file and export everything it defines (no key is echoed).
   set -a; . "$ENV_FILE"; set +a
 
+  # Second upstream: the logfare/* entries in the config read LOGFARE_API_KEY.
+  # The key already lives in the CLI's own Logfare profile; this proxy only
+  # copies it, so switching provider does not mean editing two files. A
+  # missing key is not fatal: the logfare/* models then fail on use while the
+  # Token Juice ones keep working.
+  local logfare_profile="${LOGFARE_PROFILE:-$HOME/.config/zim-claude/logfare}"
+  if [[ -z "${LOGFARE_API_KEY:-}" && -r "$logfare_profile" ]]; then
+    local _k
+    _k="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?ANTHROPIC_AUTH_TOKEN[[:space:]]*=[[:space:]]*//p' "$logfare_profile" \
+          | tail -n 1 | sed -e 's/^["'\'']//' -e 's/["'\'']*[[:space:]]*\(#.*\)\?$//')"
+    [[ -n "$_k" ]] && export LOGFARE_API_KEY="$_k"
+    unset _k
+  fi
+  if [[ -z "${LOGFARE_API_KEY:-}" ]]; then
+    log "no Logfare key found ($logfare_profile) — logfare/* models will fail on use"
+  fi
+
   # Verify every os.environ/<VAR> referenced by the config is now set.
   local missing=0 var
   while IFS= read -r var; do
@@ -118,7 +135,8 @@ do_start() {
       err "required env var '$var' (referenced by config) is unset after sourcing $ENV_FILE"
       missing=1
     fi
-  done < <(grep -oE 'os\.environ/[A-Za-z_][A-Za-z0-9_]*' "$CONFIG" 2>/dev/null | sed 's|os\.environ/||' | sort -u)
+  done < <(grep -oE 'os\.environ/[A-Za-z_][A-Za-z0-9_]*' "$CONFIG" 2>/dev/null \
+             | sed 's|os\.environ/||' | sort -u)
   if [[ "$missing" -ne 0 ]]; then exit 1; fi
 
   log "starting proxy on :$PORT  (config: $CONFIG)"
