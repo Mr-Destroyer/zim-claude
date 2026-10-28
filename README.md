@@ -11,6 +11,7 @@ it just talks to TokenHarbor instead of Anthropic.</p>
 <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-2f81f7?style=flat-square" alt="Platform"></a>
 <a href="#token-juice-is-down"><img src="https://img.shields.io/badge/Token%20Juice-down-d97757?style=flat-square" alt="Token Juice is down"></a>
 <a href="#the-litellm-proxy-optional"><img src="https://img.shields.io/badge/proxy-LiteLLM%20(optional)-6f42c1?style=flat-square" alt="Optional LiteLLM proxy"></a>
+<a href="https://discord.gg/7dDwHj6fxf"><img src="https://img.shields.io/badge/Discord-new%20keys-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord — new keys"></a>
 </p>
 
 <img src="screenshots/screenshot-1-zim-claude.png" alt="zim-claude running in a terminal" width="620">
@@ -45,8 +46,12 @@ refuses to run against it — see [Token Juice is down](#token-juice-is-down).
 
 ## Token Juice is down
 
-Token Juice's unlimited quota ended, so `zim-claude` no longer routes to it. That is a
-hard rule in the wrapper, not a default you can drift back into:
+Token Juice's unlimited quota ended, so `zim-claude` no longer routes to it. **The shared
+Token Juice key has been revoked**: it no longer authenticates anywhere, with or without
+`zim-claude`. New keys and updates are announced in the Discord —
+**[discord.gg/7dDwHj6fxf](https://discord.gg/7dDwHj6fxf)**.
+
+The refusal is a hard rule in the wrapper, not a default you can drift back into:
 
 | Situation | What happens |
 |---|---|
@@ -57,9 +62,9 @@ hard rule in the wrapper, not a default you can drift back into:
 | `ZIM_CLAUDE_BASE_URL` names Token Juice | refused, with the reason |
 | `ZIM_CLAUDE_USE_TOKENHARBOR=0` | refused, with the reason |
 
-The public Token Juice key still ships in `config/token` — it is public by design — but
-**nothing loads it any more**: not the installer, not the wrapper, not the Windows port.
-`tests/run-tests.sh` fails if a loader comes back.
+The revoked key still sits in `config/token`, kept as a marker so nobody goes looking for
+it — but **nothing loads it any more**: not the installer, not the wrapper, not the Windows
+port. `tests/run-tests.sh` fails if a loader comes back.
 
 Say yes once and the choice is remembered in `~/.local/share/zim-claude/route`, so later
 runs go straight to TokenHarbor without a question. The notice stops as soon as a key of
@@ -72,6 +77,7 @@ appear from the next run — no manual upgrade step.
 ### Get a TokenHarbor key
 
 1. Create one at [tokenharbor.ai/dashboard/api-keys](https://tokenharbor.ai/dashboard/api-keys).
+   New key drops and announcements land in the [Discord](https://discord.gg/7dDwHj6fxf).
 2. Either paste it at the first prompt — it is cached at
    `~/.local/share/zim-claude/tokenharbor.key` (mode 600) — or export
    `ZIM_CLAUDE_API_KEY=thk_…` and keep it in your shell profile.
@@ -101,10 +107,11 @@ win-install.bat</code></pre>
 
 That's it. Open a new terminal and run `zim-claude`.
 
-The installer no longer asks for a Token Juice key — that route is down. It installs the
-command, records the checkout for auto-update, and leaves `~/tokenjuice/` exactly as it
-found it. Run `zim-claude` and it offers TokenHarbor (see
-[Token Juice is down](#token-juice-is-down)).
+The installer no longer asks for a Token Juice key — that route is dead, and the shared
+key was revoked. It installs the command, records the checkout for auto-update, and leaves
+`~/tokenjuice/` exactly as it found it. Run `zim-claude` and it offers TokenHarbor (see
+[Token Juice is down](#token-juice-is-down); new keys are announced in the
+[Discord](https://discord.gg/7dDwHj6fxf)).
 
 If you want the optional LiteLLM proxy route — for another harness on the machine, or
 because you have a Token Juice key of your own — pass it in:
@@ -745,12 +752,13 @@ on that directory and on the model name, so a rename in one place cannot silentl
 from the others. Note that `start-litellm.sh`'s `help` reads its own header with
 `sed -n '2,9p'`, so its comment block must stay on lines 2–9.
 
-**The key in `config/token` is public on purpose — and deliberately unloaded.** It is a
-shared Token Juice key that used to make a fresh install work without a prompt. Token
-Juice's unlimited quota ended, so nothing reads it any more: `install.sh`, both wrappers
-and the Windows port all skip it, and `tests/run-tests.sh` fails if a loader comes back.
-It stays in the tree because it is public by design and rotating it is the operator's
-call, not a repo edit. A scripted install can still supply a Token Juice key through
+**The key in `config/token` is revoked, public, and deliberately unloaded.** It is the
+shared Token Juice key that used to make a fresh install work without a prompt. The
+unlimited quota ended and the key was revoked, so it authenticates nowhere; nothing reads
+it any more either — `install.sh`, both wrappers and the Windows port all skip it, and
+`tests/run-tests.sh` fails if a loader comes back. It stays in the tree as a marker (and
+because deleting it would only hide the history); new keys are handed out through the
+[Discord](https://discord.gg/7dDwHj6fxf), not by editing this repo. A scripted install can still supply a Token Juice key through
 `ZIM_CLAUDE_TOKEN` for the optional proxy route, and an existing profile is never
 overwritten. The same test allows only that one shipped key and fails the suite if any
 other `tj_…`/`lfu_…`/`thk_…` key appears in a tracked file, so an accidental paste is
