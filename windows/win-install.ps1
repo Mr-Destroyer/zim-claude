@@ -315,27 +315,20 @@ function Select-ProxyPort {
 function Install-EnvProfile {
   Invoke-Step "mkdir $TokenJuiceDir" { New-Item -ItemType Directory -Force -Path $TokenJuiceDir | Out-Null }
 
-  # The key comes from ZIM_CLAUDE_TOKEN for a scripted install, or from the
-  # public key shipped in config/token. A prompt is only the last resort, for a
-  # checkout whose config/token was removed. Trims surrounding whitespace,
-  # including the CR a browser copy-paste adds - a trailing CR inside the export
-  # produces a 401 that looks like a bad key.
+  # The key comes from the profile if it has one, or from ZIM_CLAUDE_TOKEN for
+  # a scripted install. Nothing is read from this checkout any more: Token
+  # Juice's unlimited quota ended, so the key file that ships in it is
+  # deliberately not loaded, and a missing key is NOT an error - the wrapper
+  # offers TokenHarbor instead. Trims surrounding whitespace, including the CR a
+  # browser copy-paste adds - a trailing CR inside the export produces a 401
+  # that looks like a bad key.
   $token = ''
   $src = ''
   if ($env:ZIM_CLAUDE_TOKEN) {
     $token = ($env:ZIM_CLAUDE_TOKEN -replace '\s', '')
     $src = 'ZIM_CLAUDE_TOKEN'
   }
-
-  # No key on the command line: load the public key that ships with this
-  # checkout, so a fresh install never stops to ask.
-  if ([string]::IsNullOrEmpty($token)) {
-    $shippedToken = Join-Path $SrcDir 'config\token'
-    if (Test-Path -LiteralPath $shippedToken) {
-      $token = ((Get-Content -LiteralPath $shippedToken -Raw -ErrorAction SilentlyContinue) -replace '\s', '')
-      if (-not [string]::IsNullOrEmpty($token)) { $src = $shippedToken }
-    }
-  }
+  # Deliberately no fallback to the key file that ships in the checkout.
 
   $port = 0
 
@@ -383,27 +376,17 @@ function Install-EnvProfile {
   if ($port -eq 0) { $port = Select-ProxyPort -Token $token }
 
   if ([string]::IsNullOrEmpty($token)) {
+    # No credential anywhere. Not an error any more: Token Juice is down, the
+    # wrapper offers TokenHarbor on first run, and anyone who wants the proxy
+    # route can set ZIM_CLAUDE_TOKEN=tj_... and re-run. Returning success
+    # matters - the background updater runs this with no console to prompt on.
     if ($DryRun) {
-      Write-Host "    would ask for a Token Juice key (config\token is missing or empty)"
+      Write-Host "    would skip the credential profile (Token Juice is down)"
       return $true
     }
-    # Nothing to install from and no credential in the profile: ask for one.
-    # Hidden input, never echoed, never written anywhere but the profile.
-    Write-Say "Token Juice API key - create one at https://tokenjuice.ai"
-    $secure = Read-Host -AsSecureString '  paste it here (input is hidden)'
-    if ($secure) {
-      $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-      try { $token = ([Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) -replace '\s', '') }
-      finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    }
-    $src = 'the key you typed'
-    if ([string]::IsNullOrEmpty($token)) {
-      Write-Err "no Token Juice key available."
-      Write-Err "  either restore config\token, set ZIM_CLAUDE_TOKEN=tj_... and"
-      Write-Err "  re-run, or create $EnvFile by hand:"
-      Write-Err "    export ANTHROPIC_AUTH_TOKEN=`"tj_...`""
-      return $false
-    }
+    Write-Say "no Token Juice key in $EnvFile or ZIM_CLAUDE_TOKEN - skipping the profile"
+    Write-Say "  (Token Juice is down; zim-claude will offer TokenHarbor instead)"
+    return $true
   }
 
   if ($token -notmatch '^[A-Za-z0-9_.:-]+$') {
@@ -863,6 +846,13 @@ if ($script:PrereqFailed) {
   Write-Warn "install incomplete - missing prerequisites (see above)."
 }
 Write-Ok "done. Try:  zim-claude --version"
+
+Write-Host ''
+Write-Warn "Token Juice is down: its unlimited quota ended."
+Write-Say "  zim-claude no longer routes to it. Run zim-claude and it will offer"
+Write-Say "  TokenHarbor (https://tokenharbor.ai) instead; your answer is remembered."
+Write-Say "  The proxy route above stays installed for other harnesses and for anyone"
+Write-Say "  with a Token Juice key of their own."
 
 if (-not $NoStart) {
   Write-Host ''

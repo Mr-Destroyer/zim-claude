@@ -31,6 +31,12 @@ assert_contains() {
   else fail "$1" "expected to contain: $(printf '%q' "$2")"$'\n'"got: $3"; fi
 }
 
+# assert_lacks <label> <needle> <haystack>
+assert_lacks() {
+  if [[ "$3" != *"$2"* ]]; then pass "$1"
+  else fail "$1" "did not expect to find: $(printf '%q' "$2")"; fi
+}
+
 # ---------------------------------------------------------------- static ----
 
 section "static checks"
@@ -51,16 +57,16 @@ fi
 
 # The live model-name configuration lives outside the repo, in ~/tokenjuice/,
 # and belongs to whoever put it there — install.sh only creates it when it is
-# missing. What must hold is that the shipped template, the installer and the
-# proxy all agree on the directory and on the model name.
+# missing. What must hold is that the installer and the proxy agree on the
+# directory and on the model name. The wrapper is deliberately absent from this
+# check: it no longer touches ~/tokenjuice/ at all.
 if grep -qF 'TOKENJUICE_DIR="${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}"' "$REPO/install.sh" &&
-   grep -qF 'TOKENJUICE_DIR="${ZIM_CLAUDE_TOKENJUICE_DIR:-$HOME/tokenjuice}"' "$REPO/scripts/zim-claude" &&
    grep -qF 'CONFIG="${LITELLM_CONFIG:-$TOKENJUICE_DIR/litellm-config.yaml}"' "$REPO/scripts/start-litellm.sh" &&
    grep -qF 'ENV_FILE="${LITELLM_ENV_FILE:-$TOKENJUICE_DIR/source}"' "$REPO/scripts/start-litellm.sh"; then
-  pass "config, profile and proxy agree on ~/tokenjuice"
+  pass "installer and proxy agree on ~/tokenjuice"
 else
-  fail "config, profile and proxy disagree on ~/tokenjuice" \
-       "install.sh, scripts/zim-claude and scripts/start-litellm.sh must name the same directory"
+  fail "installer and proxy disagree on ~/tokenjuice" \
+       "install.sh and scripts/start-litellm.sh must name the same directory"
 fi
 
 if grep -qF 'api_base: https://api.tokenjuice.ai/v1' "$REPO/config/litellm-config.yaml" &&
@@ -119,14 +125,29 @@ if hits="$(grep -rn 'break-system-packages' "$REPO/install.sh" "$REPO/scripts" 2
   fail "no --break-system-packages advice remains" "$hits"
 else pass "no --break-system-packages advice remains"; fi
 
-# The public Token Juice key ships in config/token so a fresh install loads it
-# instead of stopping to prompt. It is deliberately public, and the profile
-# copies it; anyone can replace it later. Any OTHER live-looking key in the
-# checkout is still a leak.
+# The public Token Juice key stays in the tree — it is public by design — but
+# it must not be loaded anywhere any more: the unlimited quota ended and
+# zim-claude routes to TokenHarbor. Any OTHER live-looking key is still a leak.
 if [[ -f "$REPO/config/token" ]] && \
    grep -qxE 'tj_[A-Za-z0-9_-]{16,}' "$REPO/config/token"; then
-  pass "the public key ships in config/token"
-else fail "the public key ships in config/token" "config/token is missing or malformed"; fi
+  pass "the public key still ships in config/token"
+else fail "the public key still ships in config/token" "config/token is missing or malformed"; fi
+
+# Nothing may READ it back: not the installer, not the wrapper, not the Windows
+# port. That is the whole point of the change. (Prose about it is fine; a load
+# is not, so match the two read idioms rather than the string.)
+if grep -qF '<"$SRC_DIR/config/token"' "$REPO/install.sh" ||
+   grep -qF "config\\token" "$REPO/windows/win-install.ps1"; then
+  fail "no installer loads the shipped key" "a config/token read survived"
+else
+  pass "no installer loads the shipped key"
+fi
+if grep -qF 'config/token' "$REPO/scripts/zim-claude" ||
+   grep -qF 'config\token' "$REPO/windows/zim-claude.ps1"; then
+  fail "the wrapper never mentions the shipped key" "the wrapper would read it again"
+else
+  pass "the wrapper never mentions the shipped key"
+fi
 
 if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
              --exclude-dir=.git --exclude-dir=tests 2>/dev/null \
@@ -134,10 +155,16 @@ if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
   fail "no other live API key is committed" "$hits"
 else pass "no other live API key is committed"; fi
 
-# The Token Juice route replaced two earlier providers. Neither may creep back in.
-if hits="$(grep -rniE 'logfare|tokenharbor' "$REPO" --exclude-dir=.git --exclude-dir=tests 2>/dev/null)"; then
-  fail "no Logfare/TokenHarbor leftovers" "$hits"
-else pass "no Logfare/TokenHarbor leftovers"; fi
+# Token Juice is down; the wrapper runs against TokenHarbor and says so on
+# every run until the user has a key of their own.
+if grep -qF 'https://tokenharbor.ai' "$REPO/scripts/zim-claude" &&
+   grep -qF 'unlimited quota ended' "$REPO/scripts/zim-claude" &&
+   grep -qF 'ZIM_CLAUDE_USE_TOKENHARBOR' "$REPO/scripts/zim-claude"; then
+  pass "the wrapper targets TokenHarbor and carries the outage notice"
+else
+  fail "the wrapper targets TokenHarbor and carries the outage notice" \
+       "expected https://tokenharbor.ai, 'unlimited quota ended' and ZIM_CLAUDE_USE_TOKENHARBOR"
+fi
 
 # ------------------------------------------------------------- windows ------
 
@@ -174,8 +201,29 @@ else fail "zim-claude.cmd does not reference zim-claude.ps1"; fi
 
 # The wrapper must call the proxy manager by the name the installer ships it as.
 if grep -q "start-proxies\.ps1" "$REPO/windows/zim-claude.ps1" 2>/dev/null; then
-  pass "zim-claude.ps1 references start-proxies.ps1"
-else fail "zim-claude.ps1 does not reference start-proxies.ps1"; fi
+  fail "zim-claude.ps1 no longer manages the proxy" \
+       "the wrapper must not start the Token Juice proxy any more"
+else
+  pass "zim-claude.ps1 no longer manages the proxy"
+fi
+
+# The Windows wrapper carries the same outage notice and opt-in as the bash one,
+# and must not read the Token Juice profile or the shipped key.
+if grep -qF 'unlimited quota ended' "$REPO/windows/zim-claude.ps1" &&
+   grep -qF 'ZIM_CLAUDE_USE_TOKENHARBOR' "$REPO/windows/zim-claude.ps1" &&
+   grep -qF 'https://tokenharbor.ai' "$REPO/windows/zim-claude.ps1"; then
+  pass "zim-claude.ps1 carries the outage notice and the TokenHarbor opt-in"
+else
+  fail "zim-claude.ps1 carries the outage notice and the TokenHarbor opt-in" \
+       "expected the notice, ZIM_CLAUDE_USE_TOKENHARBOR and https://tokenharbor.ai"
+fi
+if grep -qF 'tokenjuice\source' "$REPO/windows/zim-claude.ps1" 2>/dev/null ||
+   grep -qF 'LITELLM_ENV_FILE' "$REPO/windows/zim-claude.ps1" 2>/dev/null; then
+  fail "zim-claude.ps1 does not read the Token Juice profile" \
+       "the wrapper still parses the LiteLLM-era profile"
+else
+  pass "zim-claude.ps1 does not read the Token Juice profile"
+fi
 
 # Both .cmd shims must propagate the exit code, or failures are swallowed.
 for f in win-install.bat zim-claude.cmd start-proxies.cmd verify.cmd; do
@@ -364,8 +412,8 @@ EOF
 chmod +x "$STUB_BIN/curl"
 
 # Run the installer with a HOME that has no ~/.local/bin on PATH, which also
-# exercises the PATH-not-set branch. ZIM_CLAUDE_TOKEN is the scripted way in;
-# it must override the public key that ships in config/token.
+# exercises the PATH-not-set branch. ZIM_CLAUDE_TOKEN is the scripted way to get
+# a profile; the shipped config/token is deliberately not a credential source.
 SBX_TOKEN="tj_sandbox000000000000000000000000"
 sbx_install() {
   env -i HOME="$SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
@@ -508,39 +556,39 @@ assert_contains "a profile aimed elsewhere is reported as kept" \
 assert_eq "a kept profile is mode 600" "600" \
   "$(stat -c%a "$SBX/tokenjuice/source" 2>/dev/null)"
 
-section "a fresh install loads the shipped key"
+section "a fresh install does not load the shipped key"
 
-# With no profile, no terminal and no ZIM_CLAUDE_TOKEN the installer must take
-# the public key from config/token rather than stopping to prompt.
+# The public key still ships in config/token (it is public by design), but the
+# unlimited quota ended: nothing may load it any more. With no profile, no
+# terminal and no ZIM_CLAUDE_TOKEN, the installer must skip the credential and
+# carry on — the wrapper offers TokenHarbor instead.
 AUTOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-autokey-XXXXXX")"
 out="$(env -i HOME="$AUTOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" </dev/null 2>&1)"
-assert_contains "the shipped key is used without a prompt" "writing env file" "$out"
-got="$(sed -n 's/^export ANTHROPIC_AUTH_TOKEN="\(.*\)"$/\1/p' "$AUTOKEY_SBX/tokenjuice/source" 2>/dev/null)"
-assert_eq "profile carries the public key from config/token" \
-  "$(tr -d ' \t\r\n' < "$REPO/config/token")" "$got"
+assert_contains "the shipped key is not used" "skipping the profile" "$out"
+assert_contains "the outage is named" "Token Juice is down" "$out"
+[[ -e "$AUTOKEY_SBX/tokenjuice/source" ]] \
+  && fail "no profile is invented from config/token" "a profile was written" \
+  || pass "no profile is invented from config/token"
 [[ -x "$AUTOKEY_SBX/.local/bin/zim-claude" ]] && pass "CLI installs without being asked" \
   || fail "CLI installs without being asked"
 rm -rf "$AUTOKEY_SBX"
 
-section "a missing key is reported, not guessed"
+section "a missing key is not an error"
 
-# A checkout whose config/token was deleted, with no profile, no terminal and no
-# ZIM_CLAUDE_TOKEN, has nothing to install from. It must say so and still leave
-# a usable CLI behind.
+# A machine with no key at all is the normal case now. The install must not
+# fail, must not invent a profile, and must leave a usable CLI behind — the
+# background auto-updater runs exactly this path with stdin closed.
 NOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nokey-XXXXXX")"
-NOKEY_REPO="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nokey-repo-XXXXXX")"
-cp -a "$REPO/." "$NOKEY_REPO/"
-rm -f "$NOKEY_REPO/config/token"
 out="$(env -i HOME="$NOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
-  bash "$NOKEY_REPO/install.sh" </dev/null 2>&1)"
-assert_contains "a missing key is named" "no Token Juice key available" "$out"
-assert_contains "the fix is spelled out" "ZIM_CLAUDE_TOKEN" "$out"
+  bash "$REPO/install.sh" --no-venv --no-rc </dev/null 2>&1)"
+assert_contains "the missing key is explained, not fatal" "skipping the profile" "$out"
+assert_contains "the fix for the proxy route is named" "ZIM_CLAUDE_TOKEN" "$out"
 [[ -x "$NOKEY_SBX/.local/bin/zim-claude" ]] && pass "CLI installs without a key" \
   || fail "CLI installs without a key"
 [[ -e "$NOKEY_SBX/tokenjuice/source" ]] && fail "no profile is invented" "an empty profile was written" \
   || pass "no profile is invented"
-rm -rf "$NOKEY_SBX" "$NOKEY_REPO"
+rm -rf "$NOKEY_SBX"
 
 section "proxy port selection"
 
@@ -638,95 +686,294 @@ chmod 600 "$SBX/tokenjuice/source"
 section "argument pass-through"
 
 ZC="$SBX/.local/bin/zim-claude"
-# stderr is dropped here (and asserted separately where it matters) so the
-# wrapper's advisory warnings don't clutter the test log.
-run_stub() { env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 "$ZC" "$@" 2>/dev/null; }
 
-out="$(run_stub)"
+# The wrapper calls curl for /v1/models. A stub answers from ZC_STATUS /
+# ZC_MODELS, so no test needs the network. It lives in its own bin dir: the
+# installer's stub answers port probes with a bare status code and no body.
+ZCURL="$SBX/zcbin"
+mkdir -p "$ZCURL"
+cat > "$ZCURL/curl" <<'EOF'
+#!/usr/bin/env bash
+# Test stub for curl. Deliberately avoids ${VAR:-{...}} defaults: bash ends
+# such an expansion at the first unescaped '}', truncating a JSON default.
+code="${ZC_STATUS:-200}"
+body=""
+if [[ "$code" == "200" ]]; then
+  body="${ZC_MODELS}"
+  if [[ -z "$body" ]]; then
+    body='{"object":"list","data":[{"id":"claude-opus-5.5"},{"id":"deepseek-v4.1-flash:free"},{"id":"mimo-v2.6-flash:free"},{"id":"th-rudder"},{"id":"gpt-6-astra"}]}'
+  fi
+fi
+printf '%s' "$body"
+printf '\n%s' "$code"
+EOF
+chmod +x "$ZCURL/curl"
+
+ZSTATE="$SBX/zstate"
+# stderr is dropped here (and asserted separately where it matters) so the
+# wrapper's advisory warnings don't clutter the test log. ZC_OPTIN defaults to
+# 1 so these tests exercise the route without an interactive prompt.
+run_zc() { env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY="${ZC_KEY-thk_live_TESTKEY}" \
+  ZIM_CLAUDE_MODEL="${ZC_MODEL-deepseek-v4.1-flash:free}" \
+  ZIM_CLAUDE_USE_TOKENHARBOR="${ZC_OPTIN-1}" \
+  "$ZC" "$@" 2>/dev/null; }
+
+out="$(run_zc)"
 assert_eq "no args -> ARGC=0" "ARGC=0" "$(head -1 <<<"$out")"
 
-out="$(run_stub --dangerously-skip-permissions)"
+out="$(run_zc --dangerously-skip-permissions)"
 assert_eq "--dangerously-skip-permissions -> ARGC=1" "ARGC=1" "$(head -1 <<<"$out")"
 assert_contains "  ...forwarded verbatim" "[1]=<--dangerously-skip-permissions>" "$out"
 
-out="$(run_stub mcp add "my server" --command "npx -y foo bar")"
+out="$(run_zc mcp add "my server" --command "npx -y foo bar")"
 assert_eq "mcp add with spaces -> ARGC=5" "ARGC=5" "$(head -1 <<<"$out")"
 assert_contains "  ...positional name with space preserved" "[3]=<my server>" "$out"
 assert_contains "  ...embedded-space command preserved" "[5]=<npx -y foo bar>" "$out"
 
-out="$(run_stub -- --not-a-flag)"
+out="$(run_zc -- --not-a-flag)"
 assert_eq "-- separator -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
 assert_contains "  ...-- forwarded literally" "[1]=<-->" "$out"
 
-out="$(run_stub "" x)"
+out="$(run_zc "" x)"
 assert_eq "empty string arg -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
 assert_contains "  ...empty arg preserved" "[1]=<>" "$out"
 
-out="$(run_stub "$(printf 'a\nb')" 'c"d')"
+out="$(run_zc "$(printf 'a\nb')" 'c"d')"
 assert_eq "newline/quote args -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
 assert_contains "  ...newline preserved" "[1]=<a" "$out"
 
-out="$(run_stub mcp list)"
+out="$(run_zc mcp list)"
 assert_eq "mcp list -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
 assert_contains "  ...subcommand forwarded" "[1]=<mcp>" "$out"
 
 section "environment handling"
 
-out="$(run_stub --version)"
-assert_contains "profile base url reaches claude" "BASE_URL=http://localhost:4000" "$out"
-assert_contains "profile model reaches claude" "MODEL=deepseek-v4.1-flash-1017" "$out"
+out="$(run_zc --version)"
+assert_contains "TokenHarbor base url reaches claude" "BASE_URL=https://tokenharbor.ai" "$out"
+assert_contains "the chosen model reaches claude" "MODEL=deepseek-v4.1-flash:free" "$out"
 assert_contains "auth token exported" "TOKEN_SET=yes" "$out"
 assert_contains "ANTHROPIC_API_KEY is empty" "APIKEY=<>" "$out"
+assert_contains "every Anthropic tier is pinned to the chosen model" \
+  "TIERS=deepseek-v4.1-flash:free|deepseek-v4.1-flash:free|deepseek-v4.1-flash:free|deepseek-v4.1-flash:free" "$out"
 
-# The regression test for the competing provider in ~/.bashrc.
-out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>/dev/null)"
-assert_contains "inherited base url is overridden" "BASE_URL=http://localhost:4000" "$out"
+# An inherited Token Juice route is the one thing this package must never pick
+# back up: the proxy is gone from the wrapper, so the stale value is reported
+# and replaced rather than followed.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  ANTHROPIC_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>/dev/null)"
+assert_contains "an inherited Token Juice base url is not used" "BASE_URL=https://tokenharbor.ai" "$out"
 
-err="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>&1 >/dev/null)"
-assert_contains "override is reported on stderr" "overriding inherited ANTHROPIC_BASE_URL" "$err"
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  ANTHROPIC_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>&1 >/dev/null)"
+assert_contains "the dropped Token Juice route is reported" \
+  "ignoring inherited ANTHROPIC_BASE_URL" "$err"
 
-out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
   ANTHROPIC_API_KEY="sk-a-real-looking-key" "$ZC" --version 2>/dev/null)"
 assert_contains "inherited API key is cleared" "APIKEY=<>" "$out"
 
-# set -a must not leak: only names the profile assigns are touched.
-out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
+# set -a must not leak: only names the wrapper assigns are touched.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
   ZIM_TEST_UNRELATED="untouched" "$ZC" --version 2>/dev/null)"
 assert_contains "unrelated env var survives" "UNRELATED=untouched" "$out"
 
-out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 ZIM_TEST_CHECK_FDS=1 "$ZC" --version 2>/dev/null)"
-assert_contains "no flock fd leaks into claude" "FD_LEAK=no" "$out"
+section "the Token Juice notice"
 
-section "fail-closed behaviour"
+NSTATE="$SBX/state-notice"
+notice_zc() { env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$NSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  "$ZC" --version </dev/null; }
 
-# Missing profile must be fatal: falling through would run against whatever
-# provider the user's shell already exports.
-env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  LITELLM_ENV_FILE=/nonexistent "$ZC" --version >/dev/null 2>&1
-assert_eq "missing env file exits 2" "2" "$?"
+err="$(notice_zc 2>&1 >/dev/null)"
+assert_eq "no key and no answer exits 2" "2" "$?"
+assert_contains "the notice names Token Juice" "Token Juice is currently down" "$err"
+assert_contains "the notice says the quota ended" "unlimited quota ended" "$err"
+assert_contains "the notice points at the opt-in" "ZIM_CLAUDE_USE_TOKENHARBOR=1" "$err"
 
-err="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  LITELLM_ENV_FILE=/nonexistent "$ZC" --version 2>&1 >/dev/null)"
-assert_contains "missing env file explains why" "Refusing to run" "$err"
+# The notice is a line on stderr, never a reason to block a working session:
+# with a key configured there is nothing to report.
+KSTATE="$SBX/state-keyed"
+mkdir -p "$KSTATE"
+printf 'thk_live_CACHED\n' > "$KSTATE/tokenharbor.key"
+chmod 600 "$KSTATE/tokenharbor.key"
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$KSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>/dev/null)"
+assert_contains "a cached key is used without a prompt" "TOKEN_SET=yes" "$out"
 
-printf 'export FOO=1\n' > "$SBX/bad-profile"
-env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  LITELLM_ENV_FILE="$SBX/bad-profile" "$ZC" --version >/dev/null 2>&1
-assert_eq "profile without a token exits 2" "2" "$?"
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$KSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>&1 >/dev/null)"
+if [[ "$err" == *"Token Juice is currently down"* ]]; then
+  fail "the notice stops once a key is configured" "still printed: $err"
+else pass "the notice stops once a key is configured"; fi
 
-env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN=/nonexistent/claude ZIM_CLAUDE_NO_PROXY=1 "$ZC" --version >/dev/null 2>&1
+# A key from the environment is the user's, not ours to keep on disk.
+[[ -e "$ZSTATE/tokenharbor.key" ]] \
+  && fail "an environment key is never cached" "$ZSTATE/tokenharbor.key exists" \
+  || pass "an environment key is never cached"
+
+section "the TokenHarbor opt-in"
+
+# =1 skips the question and remembers the answer...
+OSTATE="$SBX/state-optin"
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 "$ZC" --version 2>/dev/null)"
+assert_contains "the opt-in runs against TokenHarbor" "BASE_URL=https://tokenharbor.ai" "$out"
+assert_contains "the opt-in is remembered" "tokenharbor" "$(cat "$OSTATE/route" 2>/dev/null)"
+
+# ...so the next run needs neither the variable nor a prompt.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  "$ZC" --version 2>/dev/null)"
+assert_contains "a remembered opt-in needs no variable" "BASE_URL=https://tokenharbor.ai" "$out"
+
+# =0 is a refusal: the wrapper must not fall through to anything.
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=0 "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "declining TokenHarbor exits 2" "2" "$?"
+assert_contains "declining still reports the outage" "Token Juice is down" "$err"
+
+section "wrapper: the free-model picker"
+
+if command -v script >/dev/null 2>&1; then
+  # zc_pty <stdin> <shell-snippet> [models-json]
+  zc_pty() {
+    printf '%s' "$1" | env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+      ZC_MODELS="${3:-}" ZC_STATUS="${4:-200}" \
+      script -qec "$2" /dev/null 2>&1
+  }
+
+  # No key anywhere: the wrapper offers TokenHarbor, then asks for a key, then
+  # offers the free models. The pty carries all three answers.
+  out="$(zc_pty $'y\nthk_live_TYPED\n\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pty ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
+  assert_contains "the wrapper offers TokenHarbor" "Use TokenHarbor instead?" "$out"
+  assert_contains "a yes asks for a key" "paste it here" "$out"
+  assert_contains "the typed key is accepted" "TOKEN_SET=yes" "$out"
+  assert_contains "free models are listed" "deepseek-v4.1-flash:free" "$out"
+  assert_contains "a second free model is listed" "mimo-v2.6-flash:free" "$out"
+  assert_contains "th-rudder counts as free" "th-rudder" "$out"
+  assert_lacks "a paid model is not offered" "claude-opus-5.5" "$out"
+
+  # Declining the offer leaves nothing to run against and says why.
+  out="$(zc_pty $'n\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-decline ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
+  assert_contains "declining explains there is nothing to run" "TokenHarbor was declined" "$out"
+
+  # The second entry selects the second free model.
+  out="$(zc_pty $'y\nthk_live_TYPED\n2\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
+  assert_contains "the second entry is selected" "MODEL=mimo-v2.6-flash:free" "$out"
+
+  # A remembered choice becomes the default, so Enter is stable. The route and
+  # the key are both remembered by now, so the empty line accepts the default.
+  out="$(zc_pty $'\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
+  assert_contains "the last pick is remembered as the default" "select 1-3 [2]" "$out"
+
+  # Nonsense is re-asked, not accepted.
+  out="$(zc_pty $'9\n1\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
+  assert_contains "an out-of-range choice is rejected" "not a choice: 9" "$out"
+  assert_contains "a valid choice still works after that" "MODEL=deepseek-v4.1-flash:free" "$out"
+
+  # A catalog with no :free ids falls back to the whole list instead of
+  # refusing to start.
+  out="$(zc_pty $'\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-nofree ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_live_TESTKEY $ZC --version" \
+        '{"data":[{"id":"claude-opus-5.5"},{"id":"gpt-6-astra"}]}')"
+  assert_contains "a catalog with no free route says so" "no free model is advertised" "$out"
+  assert_contains "a catalog with no free route still offers models" "claude-opus-5.5" "$out"
+else
+  skip "script(1) not available — cannot drive the interactive prompts"
+fi
+
+# A pinned model skips the picker entirely.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=mimo-v2.6-flash:free \
+  ZIM_CLAUDE_USE_TOKENHARBOR=1 "$ZC" --version 2>/dev/null)"
+assert_lacks "a pinned model skips the picker" "free models on" "$out"
+assert_contains "a pinned model is used" "MODEL=mimo-v2.6-flash:free" "$out"
+
+section "wrapper: Token Juice cannot come back"
+
+# The shipped key is public and stays in the tree, but it must not be usable
+# through zim-claude: Token Juice's unlimited quota ended.
+TJ_KEY="$(tr -d ' \t\r\n' < "$REPO/config/token" 2>/dev/null || true)"
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY="$TJ_KEY" ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "the shipped Token Juice key is refused" "2" "$?"
+assert_contains "the refusal names the key type" "Token Juice key" "$err"
+
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  ZIM_CLAUDE_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "pointing the base url at Token Juice is refused" "2" "$?"
+assert_contains "the base url refusal names the quota" "unlimited quota ended" "$err"
+
+# Nothing in the wrapper may read the Token Juice profile or the shipped key.
+for needle in 'tokenjuice/source' 'config/token' 'LITELLM_ENV_FILE' 'ANTHROPIC_AUTH_TOKEN="$token"'; do
+  if grep -qF -- "$needle" "$REPO/scripts/zim-claude"; then
+    fail "the wrapper does not read Token Juice state" "found: $needle"
+  else
+    pass "the wrapper does not read Token Juice state ($needle)"
+  fi
+done
+
+section "wrapper: failure modes"
+
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_STATUS=401 \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_BAD ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "a rejected environment key exits 2" "2" "$?"
+assert_contains "a rejected environment key says where to rotate" \
+  "Rotate it at https://tokenharbor.ai/dashboard/api-keys" "$err"
+
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_STATUS=000 \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "an unreachable API exits 2" "2" "$?"
+assert_contains "an unreachable API names the host" "could not reach https://tokenharbor.ai" "$err"
+
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_MODELS='{"data":[]}' \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "an empty catalog exits 2" "2" "$?"
+assert_contains "an empty catalog says so" "returned no model ids" "$err"
+
+env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN=/nonexistent/claude ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" --version >/dev/null 2>&1
 assert_eq "missing claude binary exits 2" "2" "$?"
 
 # A non-zero exit from claude must pass through untouched, not become 2.
@@ -735,18 +982,23 @@ cat > "$SBX/stub-fail" <<'EOF'
 exit 42
 EOF
 chmod +x "$SBX/stub-fail"
-env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$SBX/stub-fail" ZIM_CLAUDE_NO_PROXY=1 "$ZC" >/dev/null 2>&1
+env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$SBX/stub-fail" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  "$ZC" >/dev/null 2>&1
 assert_eq "claude's exit code passes through" "42" "$?"
 
 section "stdout hygiene"
 
-out="$(env -i HOME="$SBX" PATH="/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_NO_PROXY=1 \
-  ANTHROPIC_BASE_URL="https://cavoti.com/" "$ZC" --version 2>/dev/null)"
+out="$(run_zc --version)"
 assert_contains "stub output reaches stdout" "ARGC=1" "$out"
-if [[ "$out" == *"overriding"* ]]; then fail "warnings stay off stdout" "found warning on stdout"
-else pass "warnings stay off stdout (clean)"; fi
+if [[ "$out" == *"[zim-claude]"* ]]; then
+  fail "diagnostics stay off stdout" "found a [zim-claude] line on stdout"
+else pass "diagnostics stay off stdout (clean)"; fi
+
+# Even the outage notice must not pollute stdout, or `-p ... | jq` breaks.
+out="$(notice_zc 2>/dev/null)"
+assert_eq "the notice does not reach stdout" "" "$out"
 
 section "clean install with prerequisites present"
 
@@ -770,6 +1022,19 @@ assert_eq "installer exits 0 when prereqs present" "0" "$?"
   && fail "existing litellm is reused, not duplicated" "installer built a venv anyway" \
   || pass "existing litellm is reused, not duplicated"
 rm -rf "$PREREQ_SBX"
+
+# The auto-updater installs with stdin closed and no terminal. That path must
+# succeed on a machine with no Token Juice profile — otherwise every upgrade
+# fails exactly where nobody is looking.
+UPGRADE_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-upgrade-XXXXXX")"
+out="$(env -i HOME="$UPGRADE_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" --no-venv --no-rc </dev/null 2>&1)"
+assert_contains "an upgrade without a profile says it is skipping it" \
+  "skipping the profile" "$out"
+[[ -x "$UPGRADE_SBX/.local/bin/zim-claude" ]] \
+  && pass "the upgrade path still installs the wrapper" \
+  || fail "the upgrade path still installs the wrapper"
+rm -rf "$UPGRADE_SBX"
 
 section "uninstall"
 
@@ -797,11 +1062,25 @@ section "proxy virtualenv"
 VENV_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-venv-XXXXXX")"
 out="$(env -i HOME="$VENV_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_TOKEN="$SBX_TOKEN" bash "$REPO/install.sh" </dev/null 2>&1)"
-assert_eq "no-litellm install still exits 1 for prereqs" "1" "$?"
+assert_eq "a no-claude sandbox still exits 1 for prereqs" "1" "$?"
 assert_contains "installer reports it skipped the venv" "skipping the proxy virtualenv" "$out"
 assert_contains "installer says the proxy has no litellm" "no litellm to run" "$out"
 [[ -x "$VENV_SBX/.local/bin/zim-claude" ]] && pass "wrapper still installed without a venv" \
   || fail "wrapper still installed without a venv"
+# With claude present, a missing litellm is a note, not a failed install: the
+# proxy is optional now, and the background updater runs this exact path on
+# machines that never had litellm.
+NOLITELLM_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-nolitellm-XXXXXX")"
+mkdir -p "$NOLITELLM_SBX/bin"
+ln -sf "$STUB" "$NOLITELLM_SBX/bin/claude"
+env -i HOME="$NOLITELLM_SBX" PATH="$NOLITELLM_SBX/bin:/usr/bin:/bin" TERM=dumb \
+  bash "$REPO/install.sh" --no-venv --no-rc </dev/null >/dev/null 2>&1
+assert_eq "a missing litellm does not fail the install" "0" "$?"
+[[ -x "$NOLITELLM_SBX/.local/bin/zim-claude" ]] \
+  && pass "the CLI is installed with no litellm" \
+  || fail "the CLI is installed with no litellm"
+rm -rf "$NOLITELLM_SBX"
+
 [[ -e "$VENV_SBX/.local/share/zim-claude/venv" ]] \
   && fail "no venv built without consent" "installer built one unprompted" \
   || pass "no venv built without consent"

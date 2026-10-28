@@ -2,15 +2,15 @@
 
 <h1>zim-claude</h1>
 
-<p><strong>Claude Code, pointed at a local LiteLLM proxy.</strong></p>
+<p><strong>Claude Code, pointed at TokenHarbor.</strong></p>
 
 <p>Same flags, same subcommands, same interactive UI as <code>claude</code> —<br>
-it just talks to a local proxy instead of Anthropic.</p>
+it just talks to TokenHarbor instead of Anthropic.</p>
 
 <p>
 <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-2f81f7?style=flat-square" alt="Platform"></a>
-<a href="#the-proxy"><img src="https://img.shields.io/badge/proxy-LiteLLM-6f42c1?style=flat-square" alt="Proxy"></a>
-<a href="#claude-desktop--the-zim-gateway"><img src="https://img.shields.io/badge/Claude%20Desktop-gateway%20%3A4002-d97757?style=flat-square" alt="Claude Desktop gateway"></a>
+<a href="#token-juice-is-down"><img src="https://img.shields.io/badge/Token%20Juice-down-d97757?style=flat-square" alt="Token Juice is down"></a>
+<a href="#the-litellm-proxy-optional"><img src="https://img.shields.io/badge/proxy-LiteLLM%20(optional)-6f42c1?style=flat-square" alt="Optional LiteLLM proxy"></a>
 </p>
 
 <img src="screenshots/screenshot-1-zim-claude.png" alt="zim-claude running in a terminal" width="620">
@@ -31,16 +31,52 @@ zim-claude mcp list                         # any claude subcommand works
 zim-claude mcp add demo -- npx -y some-mcp  # arguments pass through untouched
 ```
 
-The proxy starts automatically the first time you use it, and the health check costs
-about 8 ms once it is already up.
+No proxy, no config file, no daemon. TokenHarbor serves the Anthropic Messages API
+natively, so `zim-claude` validates your key against `/v1/models`, picks a model, and
+`exec`s `claude` with `ANTHROPIC_*` set for that process only.
 
 ```
-  Claude Code  ──▶  LiteLLM :4000  ──▶  Token Juice  ──▶  DeepSeek-V4.1-Flash
-   zim-claude          (local)                            (the model)
+  Claude Code  ──▶  TokenHarbor  ──▶  the model you picked
+   zim-claude        (direct)          (free routes first)
 ```
 
-The port is auto-detected at install time and recorded in the profile; `:4000` is the
-default. See [Which port it picks](#which-port-it-picks).
+**Token Juice is no longer the route.** Its unlimited quota ended, and the wrapper
+refuses to run against it — see [Token Juice is down](#token-juice-is-down).
+
+## Token Juice is down
+
+Token Juice's unlimited quota ended, so `zim-claude` no longer routes to it. That is a
+hard rule in the wrapper, not a default you can drift back into:
+
+| Situation | What happens |
+|---|---|
+| No TokenHarbor key configured | one line on stderr every run: `Token Juice is currently down — its unlimited quota ended.` |
+| First run, terminal available | `Use TokenHarbor instead? [y/N]`; a yes is remembered |
+| No terminal (script, CI) | exits 2 and names `ZIM_CLAUDE_USE_TOKENHARBOR=1` |
+| `ZIM_CLAUDE_API_KEY` holds a `tj_…` key | refused — it cannot work, so it is never sent anywhere |
+| `ZIM_CLAUDE_BASE_URL` names Token Juice | refused, with the reason |
+| `ZIM_CLAUDE_USE_TOKENHARBOR=0` | refused, with the reason |
+
+The public Token Juice key still ships in `config/token` — it is public by design — but
+**nothing loads it any more**: not the installer, not the wrapper, not the Windows port.
+`tests/run-tests.sh` fails if a loader comes back.
+
+Say yes once and the choice is remembered in `~/.local/share/zim-claude/route`, so later
+runs go straight to TokenHarbor without a question. The notice stops as soon as a key of
+your own is configured.
+
+**An install from the Token Juice era carries itself over.** The wrapper's background
+auto-update pulls this version and re-installs it, so the notice and the TokenHarbor offer
+appear from the next run — no manual upgrade step.
+
+### Get a TokenHarbor key
+
+1. Create one at [tokenharbor.ai/dashboard/api-keys](https://tokenharbor.ai/dashboard/api-keys).
+2. Either paste it at the first prompt — it is cached at
+   `~/.local/share/zim-claude/tokenharbor.key` (mode 600) — or export
+   `ZIM_CLAUDE_API_KEY=thk_…` and keep it in your shell profile.
+3. Free routes carry a `:free` suffix and are offered first. Pin one with
+   `ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free` to skip the picker.
 
 ---
 
@@ -65,10 +101,13 @@ win-install.bat</code></pre>
 
 That's it. Open a new terminal and run `zim-claude`.
 
-A **public Token Juice API key ships in `config/token`**, so the installer loads it and
-carries on without asking. If you already have a key in `~/tokenjuice/source`, that one is
-kept and never overwritten. To use your own key (create one at
-[tokenjuice.ai](https://tokenjuice.ai)) on a fresh install, pass it in:
+The installer no longer asks for a Token Juice key — that route is down. It installs the
+command, records the checkout for auto-update, and leaves `~/tokenjuice/` exactly as it
+found it. Run `zim-claude` and it offers TokenHarbor (see
+[Token Juice is down](#token-juice-is-down)).
+
+If you want the optional LiteLLM proxy route — for another harness on the machine, or
+because you have a Token Juice key of your own — pass it in:
 
 ```bash
 ZIM_CLAUDE_TOKEN=tj_… ./install.sh
@@ -78,8 +117,8 @@ ZIM_CLAUDE_TOKEN=tj_… ./install.sh
 
 | Installer | Platform | What it sets up | Run it with |
 |---|---|---|---|
-| `install.sh` | Linux · macOS · WSL | CLI proxy (port auto-detected) + the `zim-claude` command | `./install.sh` |
-| `windows\win-install.bat` | Windows | **both** proxies — the CLI proxy *and* the `:4002` gateway — plus `zim-claude` | `win-install.bat` |
+| `install.sh` | Linux · macOS · WSL | the `zim-claude` command (TokenHarbor) + the optional CLI proxy | `./install.sh` |
+| `windows\win-install.bat` | Windows | `zim-claude`, plus the optional CLI proxy *and* the `:4002` desktop gateway | `win-install.bat` |
 | `claude-desktop-integration/install.sh` | Linux · macOS | the `:4002` gateway only | `cd claude-desktop-integration && ./install.sh` |
 
 You normally only need the first one for your platform. The third exists for people who
@@ -93,7 +132,8 @@ want the Claude Desktop gateway without the CLI side.
 
 ## Requirements
 
-The installer checks for each of these and offers to install anything missing.
+`zim-claude` itself needs `claude`, `bash`, `curl` and `base64`; the optional proxy needs
+`litellm` on top. The installer checks for each and offers to install anything missing.
 **Nothing is installed without you answering `y`.**
 
 | Tool | If missing |
@@ -156,9 +196,12 @@ directory to `PATH`.)
 | `~/.local/bin/zim-claude` | the command |
 | `~/.local/bin/zim-claude-update.sh` | background self-updater (also runnable by hand) |
 | `~/.local/bin/start-litellm.sh` | proxy manager: `start`/`stop`/`restart`/`status`/`logs` |
-| `~/tokenjuice/source` | the env profile — Token Juice key + base URL + model (mode 600) |
+| `~/tokenjuice/source` | the optional proxy's env profile — Token Juice key + base URL + model (mode 600); only written when you pass `ZIM_CLAUDE_TOKEN` |
 | `~/tokenjuice/litellm-config.yaml` | LiteLLM proxy config: which model name maps to which upstream |
 | `~/.local/share/zim-claude/venv/` | the proxy's private virtualenv (litellm + uvloop) |
+| `~/.local/share/zim-claude/route` | the remembered TokenHarbor choice |
+| `~/.local/share/zim-claude/tokenharbor.key` | your TokenHarbor key, cached after the first prompt (mode 600) |
+| `~/.local/share/zim-claude/last-model` | the model you picked last time — the picker's default |
 | `~/.local/share/zim-claude/update.conf` | which checkout and branch the updater tracks |
 | `~/.local/share/zim-claude/update.log` | what the updater did, last few hundred KB |
 | `~/.local/share/zim-claude/` | install state + backups (mode 700) |
@@ -169,7 +212,9 @@ Anything it would overwrite is backed up first, under
 ### Where the configuration lives
 
 Both the credential and the model names live in one directory outside the repo —
-`~/tokenjuice/`, which other harnesses on the machine share:
+`~/tokenjuice/`, which other harnesses on the machine share. **`zim-claude` does not read
+any of it**: this is the optional LiteLLM route, kept for the other harnesses and for a
+Token Juice key of your own.
 
 | File | What is in it | Who owns it |
 |---|---|---|
@@ -218,8 +263,8 @@ harnesses on the machine, so an existing profile and an existing model config ar
 as they are and never rewritten, `--force` included. If the profile already holds a key,
 it is kept — with a warning when it does not look like a Token Juice key (`tj_…`),
 because Token Juice will reject a key issued elsewhere. If there is no profile at all,
-the installer uses `ZIM_CLAUDE_TOKEN` when it is set, otherwise the public key in
-`config/token`, and only falls back to a hidden prompt if both are absent.
+the installer uses `ZIM_CLAUDE_TOKEN` when it is set and otherwise skips the profile
+entirely — a missing key is not an error, and nothing is read from `config/token`.
 
 It also repairs a profile that points at a port which **rejects its own token**. That
 happens when another LiteLLM — ZimZilla's, a leftover install — already owns the port
@@ -240,7 +285,7 @@ The installer probes the local ports and writes the one that works into the prof
 The default is `4000`. Candidates are tried in the order `4000`, `4001`, then `4003`–`4010`
 (`4002` is the Claude Desktop gateway). Override the whole search with `--port N`.
 
-The wrapper follows the profile's port, so a profile moved to `:4005` works with no
+The proxy manager follows the profile's port, so a profile moved to `:4005` works with no
 environment variable set. `LITELLM_PORT` still wins when you set it explicitly.
 
 ### The shell config
@@ -299,8 +344,9 @@ updated, already current, dirty, diverged, fetch failed — is a line there.
 Windows gets its own installer under `windows/`. It is **native** — no WSL, no Git Bash,
 no Node, and no Administrator rights.
 
-One installer sets up **both** proxies, because on Windows they are always wanted
-together:
+`zim-claude` itself routes straight to TokenHarbor here too — the proxies below are the
+optional LiteLLM route, and one installer sets up **both** of them because on Windows
+they are usually wanted together:
 
 | | CLI | Claude Desktop |
 |---|---|---|
@@ -362,8 +408,8 @@ execution policy blocks it anyway). `start-proxies.cmd` is what makes the plain
 command work: it passes `-ExecutionPolicy Bypass` for that one invocation, so your
 machine's policy is untouched. Every `.ps1` here has such a shim for the same reason.
 
-You normally never need these — `zim-claude` health-checks the CLI proxy and starts
-the CLI proxy if it's down, exactly as on Linux.
+You normally never need these: on Windows too, `zim-claude` itself talks to TokenHarbor
+and never starts or health-checks these proxies. They are the optional LiteLLM route.
 
 Windows gets the same auto-update as Linux: `zim-claude` starts
 `zim-claude-update.ps1` in a hidden background process and hands off immediately. It
@@ -500,9 +546,12 @@ Windows, use the in-app dialog above.
 
 ---
 
-## The proxy
+## The LiteLLM proxy (optional)
 
-`start-litellm.sh` manages it:
+This is **not** what `zim-claude` uses any more — the wrapper talks to TokenHarbor
+directly. The proxy is here for other harnesses on the machine, and for anyone running a
+Token Juice key of their own; `install.sh --start` starts it, and `start-litellm.sh`
+manages it:
 
 ```bash
 start-litellm.sh status     # is it running?
@@ -511,8 +560,9 @@ start-litellm.sh restart    # after editing the config
 start-litellm.sh stop
 ```
 
-You normally never need these — `zim-claude` health-checks the port in the profile and
-starts the proxy if it's down. The check costs ~8 ms when the proxy is already up.
+You normally never need these: nothing in `zim-claude` starts or health-checks this
+proxy. It is opt-in (`./install.sh --start`), and the Claude Desktop gateway starts on
+demand.
 
 `start-litellm.sh` finds litellm in this order, so an existing install is always
 preferred over the private venv:
@@ -531,6 +581,26 @@ through environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
+| `ZIM_CLAUDE_API_KEY` | (unset) | your TokenHarbor key; skips the prompt and is never cached (`TOKENHARBOR_API_KEY` works too) |
+| `ZIM_CLAUDE_MODEL` | (picker) | pin a model id, e.g. `deepseek-v4.1-flash:free` |
+| `ZIM_CLAUDE_BASE_URL` | `https://tokenharbor.ai` | the API host; naming Token Juice is refused |
+| `ZIM_CLAUDE_USE_TOKENHARBOR` | (ask once) | `1` = take TokenHarbor without asking, `0` = refuse |
+| `ZIM_CLAUDE_BIN` | `claude` on `PATH` | which claude to run |
+| `ZIM_CLAUDE_STATE_DIR` | `~/.local/share/zim-claude` | route, cached key and last pick |
+| `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
+
+Scripted use — no prompts at all:
+
+```bash
+ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_… \
+ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free zim-claude -p "explain this function"
+```
+
+<details>
+<summary><b>Variables for the optional LiteLLM proxy</b></summary>
+
+| Variable | Default | Meaning |
+|---|---|---|
 | `LITELLM_ENV_FILE` | `~/tokenjuice/source` | profile to source |
 | `LITELLM_CONFIG` | `~/tokenjuice/litellm-config.yaml` | proxy config — the model names live here |
 | `ZIM_CLAUDE_TOKENJUICE_DIR` | `~/tokenjuice` | where the profile and both configs live |
@@ -540,30 +610,33 @@ through environment variables:
 | `LITELLM_SERVICE` | `<install dir>/start-litellm.sh` | proxy manager |
 | `LITELLM_BIN` | (auto-detected) | pin an exact litellm binary |
 | `ZIM_CLAUDE_VENV` | `~/.local/share/zim-claude/venv` | where to look for the venv |
-| `ZIM_CLAUDE_BIN` | `claude` on `PATH` | which claude to run |
-| `ZIM_CLAUDE_NO_PROXY` | `0` | set to `1` to never touch the proxy |
-| `ZIM_CLAUDE_REQUIRE_PROXY` | `0` | set to `1` to hard-fail if the proxy is down |
-| `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
 
-Using a different profile:
+`start-litellm.sh` reads the profile itself; `zim-claude` never does.
 
-```bash
-LITELLM_ENV_FILE=~/tokenjuice/some-other-profile zim-claude
-```
+</details>
 
 ---
 
 ## Troubleshooting
 
-**`zim-claude` refuses to start, complaining about the env file.**
-This is deliberate. Without the profile, Claude Code would silently use whatever
-`ANTHROPIC_*` variables your shell already exports — a session against a different
-provider, with a different model, and nothing telling you. Re-run `install.sh`, or point
-`LITELLM_ENV_FILE` at a real profile.
+**It says `Token Juice is currently down — its unlimited quota ended`.**
+That is the intended notice, printed once on stderr until a key of your own is configured.
+Answer `y` to the TokenHarbor offer, or set `ZIM_CLAUDE_USE_TOKENHARBOR=1` and a
+`ZIM_CLAUDE_API_KEY` for scripted use.
 
-**It warns `overriding inherited ANTHROPIC_BASE_URL=...`.**
-Your shell exports an `ANTHROPIC_BASE_URL` from somewhere else. `zim-claude` overrides it
-for its own process only, so plain `claude` is unaffected. The warning is informational.
+**It exits 2 saying there is no terminal to ask on.**
+Prompts need a TTY. In a script, CI or a piped install, say what you want up front:
+`ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_…`.
+
+**`that is a Token Juice key (tj_…), and Token Juice is down`.**
+`ZIM_CLAUDE_API_KEY` (or the cached key) holds a `tj_…` key. It cannot work on this route,
+so it is refused rather than sent to TokenHarbor and reported as a bad key. Create a
+TokenHarbor key instead.
+
+**It warns `ignoring inherited ANTHROPIC_BASE_URL=...`.**
+Your shell exports an `ANTHROPIC_BASE_URL` — often the old `~/tokenjuice/source` profile
+or a `localhost:4000` proxy. `zim-claude` replaces it for its own process only, so plain
+`claude` is unaffected. The warning is informational; drop the export to silence it.
 
 **The proxy won't start.**
 
@@ -672,14 +745,16 @@ on that directory and on the model name, so a rename in one place cannot silentl
 from the others. Note that `start-litellm.sh`'s `help` reads its own header with
 `sed -n '2,9p'`, so its comment block must stay on lines 2–9.
 
-**The key in `config/token` is public on purpose.** It is a shared Token Juice key,
-committed so a fresh install loads it instead of prompting; the profile at
-`~/tokenjuice/source` (mode 600) is a copy of it, outside the checkout, and
-`install.sh` never writes a secret into the repo. A scripted install can supply a
-different key through `ZIM_CLAUDE_TOKEN`, and an existing profile is never overwritten.
-`tests/run-tests.sh` allows only that one shipped key and fails the suite if any other
-`tj_…`/`lfu_…`/`thk_…` key appears in a tracked file, so an accidental paste is caught
-before it is committed rather than after it is pushed.
+**The key in `config/token` is public on purpose — and deliberately unloaded.** It is a
+shared Token Juice key that used to make a fresh install work without a prompt. Token
+Juice's unlimited quota ended, so nothing reads it any more: `install.sh`, both wrappers
+and the Windows port all skip it, and `tests/run-tests.sh` fails if a loader comes back.
+It stays in the tree because it is public by design and rotating it is the operator's
+call, not a repo edit. A scripted install can still supply a Token Juice key through
+`ZIM_CLAUDE_TOKEN` for the optional proxy route, and an existing profile is never
+overwritten. The same test allows only that one shipped key and fails the suite if any
+other `tj_…`/`lfu_…`/`thk_…` key appears in a tracked file, so an accidental paste is
+caught before it is committed rather than after it is pushed.
 
 **Line endings are pinned in `.gitattributes`.** Git for Windows defaults to
 `core.autocrlf=true`, which would rewrite the bash scripts on checkout and make their

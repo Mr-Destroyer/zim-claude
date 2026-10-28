@@ -19,9 +19,11 @@ SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # --- what we install, and where ---------------------------------------------
 # The model-name configuration and the credential live together in ONE
-# directory outside this checkout: ~/tokenjuice/, the Token Juice route this
-# package drives. start-litellm.sh ships verbatim and its built-in defaults
-# point at exactly these locations, so the two must agree.
+# directory outside this checkout: ~/tokenjuice/. That is the LiteLLM route,
+# kept for other harnesses on the machine and for anyone with a Token Juice key
+# of their own — zim-claude itself no longer uses it (Token Juice is down, see
+# the notice at the end of the install). start-litellm.sh ships verbatim and
+# its built-in defaults point at exactly these locations, so the two must agree.
 PREFIX="${PREFIX:-$HOME/.local}"
 BIN_DIR="$PREFIX/bin"
 
@@ -308,9 +310,11 @@ install_config_yaml() {
 
 # The env file is special: it holds a live credential, so it is never
 # overwritten — not even with --force. Losing it would mean re-issuing a token.
-# The key comes from the profile if it has one, then $ZIM_CLAUDE_TOKEN for a
-# scripted install, then the public key shipped in config/token. A prompt is
-# only the last resort, for a checkout whose config/token was removed.
+# The key comes from the profile if it has one, or $ZIM_CLAUDE_TOKEN for a
+# scripted install. Nothing is read from this checkout any more: Token Juice's
+# unlimited quota ended, so config/token is deliberately not loaded (the file
+# stays — it is public by design), and a missing key is NOT an error. The
+# wrapper offers TokenHarbor instead.
 #
 # One thing is repaired, with a backup: a profile aimed at the local proxy whose
 # base URL names a port that rejects its own token. That is a real machine —
@@ -319,24 +323,6 @@ install_config_yaml() {
 #
 # A profile aimed somewhere other than the local proxy is the user's own and is
 # left alone.
-
-# ask_token — read a Token Juice key from the terminal with echo off, into
-# PROFILE_TOKEN_EFFECTIVE. Fails when there is no terminal to ask on (CI, a
-# piped install); that is exactly the case ZIM_CLAUDE_TOKEN exists for.
-ask_token() {
-  local typed=""
-  { exec 3</dev/tty; } 2>/dev/null || return 1
-  printf '\n' >&2
-  say "Token Juice API key — create one at https://tokenjuice.ai"
-  printf '  paste it here (input is hidden): ' >&2
-  IFS= read -r -s typed <&3 || typed=""
-  exec 3<&-
-  printf '\n' >&2
-  typed="$(printf '%s' "$typed" | tr -d ' \t\r\n')"
-  [[ -n "$typed" ]] || return 1
-  PROFILE_TOKEN_EFFECTIVE="$typed"
-  return 0
-}
 
 install_config_env() {
   run mkdir -p -- "$TOKENJUICE_DIR"
@@ -351,13 +337,9 @@ install_config_env() {
     src="ZIM_CLAUDE_TOKEN"
   fi
 
-  # No key on the command line: load the public Token Juice key that ships with
-  # this checkout, so a fresh install never stops to ask. Trims whitespace and
-  # the CR a Windows checkout can leave behind.
-  if [[ -z "$token" && -f "$SRC_DIR/config/token" ]]; then
-    token="$(tr -d ' \t\r\n' <"$SRC_DIR/config/token" || true)"
-    src="$SRC_DIR/config/token"
-  fi
+  # Deliberately NOT read from this checkout: Token Juice's unlimited quota
+  # ended, so config/token is no longer a credential source. The file stays in
+  # the tree (it is public by design), it just does not get loaded anywhere.
 
   PROFILE_TOKEN_EFFECTIVE="$token"
 
@@ -401,22 +383,18 @@ install_config_env() {
   fi
 
   if [[ -z "$token" ]]; then
+    # No credential anywhere. Not an error any more: Token Juice is down, the
+    # wrapper offers TokenHarbor on first run, and anyone who wants the proxy
+    # route can export ZIM_CLAUDE_TOKEN=tj_… and re-run. Returning 0 matters —
+    # the background auto-updater installs with stdin closed, so a failure here
+    # would abort every upgrade on a machine without a profile.
     if (( DRY_RUN )); then
-      printf '    would ask for a Token Juice key (config/token is missing or empty)\n'
+      printf '    would skip the credential profile (Token Juice is down)\n'
       return 0
     fi
-    # Nothing to install from and no credential in the profile: ask for one.
-    # Hidden input, never echoed, never written anywhere but the profile.
-    if ask_token; then
-      token="$PROFILE_TOKEN_EFFECTIVE"
-      src="the key you typed"
-    else
-      err "no Token Juice key available."
-      err "  either restore $SRC_DIR/config/token, export ZIM_CLAUDE_TOKEN=tj_…"
-      err "  and re-run, or create $ENV_FILE by hand:"
-      err "    export ANTHROPIC_AUTH_TOKEN=\"tj_…\""
-      return 1
-    fi
+    say "no Token Juice key in $ENV_FILE or ZIM_CLAUDE_TOKEN — skipping the profile"
+    say "  (Token Juice is down; zim-claude will offer TokenHarbor instead)"
+    return 0
   fi
 
   case "$token" in
@@ -670,10 +648,11 @@ build_proxy_venv() {   # create the venv and install litellm into it
 # rebuilds it.
 ensure_proxy_venv() {
   if (( ! DO_VENV )); then
+    # Not a prereq failure: the proxy is optional, and --no-venv is what the
+    # background updater passes on purpose.
     warn "proxy virtualenv disabled (--no-venv), and no litellm is installed."
     warn "  the proxy cannot start until you install one:"
     warn "    pipx install 'litellm[proxy]'"
-    PREREQ_FAILED=1
     return 1
   fi
 
@@ -692,7 +671,6 @@ ensure_proxy_venv() {
       *)   warn "    install your platform's python3-venv package" ;;
     esac
     warn "  or install litellm yourself: pipx install 'litellm[proxy]'"
-    PREREQ_FAILED=1
     return 1
   fi
 
@@ -753,9 +731,16 @@ check_prereqs() {
   elif [[ -x "$HOME/.local/bin/litellm" ]]; then
     say "found litellm: $HOME/.local/bin/litellm — reusing it"
   else
+    # The proxy is OPTIONAL now: Token Juice is down and zim-claude routes to
+    # TokenHarbor directly, so a missing litellm must not fail the install. The
+    # background updater runs exactly this path, and an exit 1 there would log
+    # a failed upgrade on every machine without a proxy.
     # `|| ...` is load-bearing: this script runs under `set -e`, so a bare call
     # would abort the whole install the moment the venv step declines or fails.
-    ensure_proxy_venv || PREREQ_FAILED=1
+    if ! ensure_proxy_venv; then
+      warn "litellm is not installed — the optional proxy route is unavailable."
+      warn "  zim-claude itself does not need it; re-run without --no-venv to build the venv."
+    fi
   fi
 }
 
@@ -966,6 +951,13 @@ fi
 ok "done. Try:  zim-claude --version"
 say "model configuration: $CONFIG_FILE"
 say "credential profile:  $ENV_FILE"
+
+printf '\n'
+warn "Token Juice is down: its unlimited quota ended."
+say  "  zim-claude no longer routes to it. Run zim-claude and it will offer"
+say  "  TokenHarbor (https://tokenharbor.ai) instead; your answer is remembered."
+say  "  The proxy route above stays installed for other harnesses and for anyone"
+say  "  with a Token Juice key of their own."
 
 if (( DO_START )) && [[ -x "$BIN_DIR/start-litellm.sh" ]]; then
   printf '\n'

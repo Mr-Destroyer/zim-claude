@@ -14,12 +14,6 @@ printf 'MODEL=%s\n' "${ANTHROPIC_MODEL:-}"
 printf 'TOKEN_SET=%s\n' "${ANTHROPIC_AUTH_TOKEN:+yes}"
 printf 'APIKEY=<%s>\n' "${ANTHROPIC_API_KEY:-}"
 printf 'UNRELATED=%s\n' "${ZIM_TEST_UNRELATED:-}"
-
-# Set by a test to prove no stray fd leaked in from the wrapper's flock.
-if [[ -n "${ZIM_TEST_CHECK_FDS:-}" ]]; then
-  if ls -l /proc/self/fd 2>/dev/null | grep -q 'zim-claude-proxy.lock'; then
-    printf 'FD_LEAK=yes\n'
-  else
-    printf 'FD_LEAK=no\n'
-  fi
-fi
+printf 'TIERS=%s|%s|%s|%s\n' \
+  "${ANTHROPIC_SMALL_FAST_MODEL:-}" "${ANTHROPIC_DEFAULT_HAIKU_MODEL:-}" \
+  "${ANTHROPIC_DEFAULT_SONNET_MODEL:-}" "${ANTHROPIC_DEFAULT_OPUS_MODEL:-}"
