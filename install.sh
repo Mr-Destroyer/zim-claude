@@ -314,7 +314,7 @@ install_config_yaml() {
 # scripted install. Nothing is read from this checkout any more: Token Juice's
 # unlimited quota ended, so config/token is deliberately not loaded (the file
 # stays — it is public by design), and a missing key is NOT an error. The
-# wrapper offers TokenHarbor instead.
+# wrapper routes to Coarena and asks for its own key on first run.
 #
 # One thing is repaired, with a backup: a profile aimed at the local proxy whose
 # base URL names a port that rejects its own token. That is a real machine —
@@ -383,9 +383,9 @@ install_config_env() {
   fi
 
   if [[ -z "$token" ]]; then
-    # No credential anywhere. Not an error any more: Token Juice is down, the
-    # wrapper offers TokenHarbor on first run, and anyone who wants the proxy
-    # route can export ZIM_CLAUDE_TOKEN=tj_… and re-run. Returning 0 matters —
+    # No credential anywhere. Not an error any more: the proxy is optional and
+    # zim-claude asks for its own Coarena key on first run. Anyone who wants the
+    # proxy route can export ZIM_CLAUDE_TOKEN=tj_… and re-run. Returning 0 matters —
     # the background auto-updater installs with stdin closed, so a failure here
     # would abort every upgrade on a machine without a profile.
     if (( DRY_RUN )); then
@@ -393,7 +393,7 @@ install_config_env() {
       return 0
     fi
     say "no Token Juice key in $ENV_FILE or ZIM_CLAUDE_TOKEN — skipping the profile"
-    say "  (Token Juice is down; zim-claude will offer TokenHarbor instead)"
+    say "  (the proxy profile is optional; zim-claude itself routes to Coarena)"
     return 0
   fi
 
@@ -731,8 +731,8 @@ check_prereqs() {
   elif [[ -x "$HOME/.local/bin/litellm" ]]; then
     say "found litellm: $HOME/.local/bin/litellm — reusing it"
   else
-    # The proxy is OPTIONAL now: Token Juice is down and zim-claude routes to
-    # TokenHarbor directly, so a missing litellm must not fail the install. The
+    # The proxy is OPTIONAL now: zim-claude routes to Coarena directly, so a
+    # missing litellm must not fail the install. The
     # background updater runs exactly this path, and an exit 1 there would log
     # a failed upgrade on every machine without a proxy.
     # `|| ...` is load-bearing: this script runs under `set -e`, so a bare call
@@ -953,11 +953,12 @@ say "model configuration: $CONFIG_FILE"
 say "credential profile:  $ENV_FILE"
 
 printf '\n'
-warn "Token Juice is down: its unlimited quota ended."
-say  "  zim-claude no longer routes to it. Run zim-claude and it will offer"
-say  "  TokenHarbor (https://tokenharbor.ai) instead; your answer is remembered."
-say  "  The proxy route above stays installed for other harnesses and for anyone"
-say  "  with a Token Juice key of their own."
+say "zim-claude routes to Coarena (https://coarena.ai)."
+say "  Run zim-claude and it will ask for a Coarena API key once, then save it"
+say "  to $STATE_DIR/coarena.key (mode 600). Create one at"
+say "  https://coarena.ai/account/api."
+say "  The LiteLLM proxy above is optional and unrelated: it stays installed for"
+say "  other harnesses on this machine."
 
 if (( DO_START )) && [[ -x "$BIN_DIR/start-litellm.sh" ]]; then
   printf '\n'

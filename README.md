@@ -2,16 +2,16 @@
 
 <h1>zim-claude</h1>
 
-<p><strong>Claude Code, pointed at TokenHarbor.</strong></p>
+<p><strong>Claude Code, pointed at Coarena.</strong></p>
 
 <p>Same flags, same subcommands, same interactive UI as <code>claude</code> —<br>
-it just talks to TokenHarbor instead of Anthropic.</p>
+it just talks to Coarena instead of Anthropic.</p>
 
 <p>
 <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-2f81f7?style=flat-square" alt="Platform"></a>
-<a href="#token-juice-is-down"><img src="https://img.shields.io/badge/Token%20Juice-down-d97757?style=flat-square" alt="Token Juice is down"></a>
+<a href="#coarena"><img src="https://img.shields.io/badge/Coarena-one%20key-2f81f7?style=flat-square" alt="Coarena"></a>
 <a href="#the-litellm-proxy-optional"><img src="https://img.shields.io/badge/proxy-LiteLLM%20(optional)-6f42c1?style=flat-square" alt="Optional LiteLLM proxy"></a>
-<a href="https://discord.gg/7dDwHj6fxf"><img src="https://img.shields.io/badge/Discord-new%20keys-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord — new keys"></a>
+<a href="https://coarena.ai/account/api"><img src="https://img.shields.io/badge/Coarena-get%20a%20key-5865F2?style=flat-square" alt="Get a Coarena key"></a>
 </p>
 
 <img src="screenshots/screenshot-1-zim-claude.png" alt="zim-claude running in a terminal" width="620">
@@ -32,57 +32,191 @@ zim-claude mcp list                         # any claude subcommand works
 zim-claude mcp add demo -- npx -y some-mcp  # arguments pass through untouched
 ```
 
-No proxy, no config file, no daemon. TokenHarbor serves the Anthropic Messages API
-natively, so `zim-claude` validates your key against `/v1/models`, picks a model, and
-`exec`s `claude` with `ANTHROPIC_*` set for that process only.
+No proxy, no config file, no daemon. Coarena serves the Anthropic Messages API
+natively, so `zim-claude` validates your key against `/v1/limits`, fetches the catalog,
+picks a model, and `exec`s `claude` with `ANTHROPIC_*` set for that process only.
 
 ```
-  Claude Code  ──▶  TokenHarbor  ──▶  the model you picked
-   zim-claude        (direct)          (free routes first)
+  Claude Code  ──▶  Coarena  ──▶  the model you picked
+   zim-claude      (direct)        (one key, whole catalog)
 ```
 
-**Token Juice is no longer the route.** Its unlimited quota ended, and the wrapper
-refuses to run against it — see [Token Juice is down](#token-juice-is-down).
+## Coarena
 
-## Token Juice is down
+[Coarena](https://coarena.ai) runs a free Model API in front of a frontier lineup —
+Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, GLM, MiniMax and more — behind one key and
+one Anthropic-native endpoint. `zim-claude` points a single `claude` process at it.
 
-Token Juice's unlimited quota ended, so `zim-claude` no longer routes to it. **The shared
-Token Juice key has been revoked**: it no longer authenticates anywhere, with or without
-`zim-claude`. New keys and updates are announced in the Discord —
-**[discord.gg/7dDwHj6fxf](https://discord.gg/7dDwHj6fxf)**.
+**Every model is priced at `0` in and `0` out.** That is not the same as unlimited: the
+account is metered in real dollars against a **daily allowance** (`$5.00/day` by
+default), and `/v1/limits` reports what is left. The model picker prints the remaining
+budget beside the list, so the ceiling is never a surprise:
 
-The refusal is a hard rule in the wrapper, not a default you can drift back into:
+```
+[zim-claude] models on coarena.ai/api — $4.57 of $5.00 left today
+   1) claude-fable-5             Claude Fable 5
+   ...
+   7) deepseek-v4-1-flash-1017   DeepSeek V4.1 Flash 1017
+   ...
+  select 1-18 [7]:
+```
+
+### Get a Coarena key
+
+1. Create one at [coarena.ai/account/api](https://coarena.ai/account/api).
+2. Either paste it at the first prompt — it is cached at
+   `~/.local/share/zim-claude/coarena.key` (mode 600) — or export
+   `ZIM_CLAUDE_API_KEY=coa_…` and keep it in your shell profile.
+3. Pin a model with `ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017` to skip the picker.
+
+The key is asked for **once**. After that every run reads the cached copy.
+
+### What a run actually does
+
+Five steps, in order. Each one exists because of a specific thing Coarena does
+differently from Anthropic, and each is worth knowing when something goes wrong.
+
+**1. The base URL is `https://coarena.ai/api`, not `…/api/v1`.**
+
+This is the single most common way to misconfigure a gateway, so it is worth being
+precise. The Anthropic SDK appends `/v1/messages` to whatever base it is handed. Hand it
+`https://coarena.ai/api` and a turn goes to `/api/v1/messages` — correct. Hand it
+`https://coarena.ai/api/v1` and the same turn goes to `/api/v1/v1/messages`, which
+answers **404 on every single request** while the catalog and the key check both keep
+working. The failure looks like "the model is broken" rather than "the URL is wrong", so
+`zim-claude` composes the base itself and `tests/run-tests.sh` asserts the `/api/v1`
+form never appears.
+
+**2. The key is validated against `/v1/limits`, not `/v1/models`.**
+
+`/v1/models` is **public** — it answers `200` with no key at all. Probing it would accept
+any string you typed, cache it, and only fail later on the first real turn. `/v1/limits`
+is the endpoint that actually requires the credential: `401` without a key, `200` with
+one. So the wrapper probes `/v1/limits` first, and only then fetches the catalog.
+
+**3. The catalog is fetched separately.**
+
+`/v1/limits` carries the budget; `/v1/models` carries the lineup. They are two requests
+because they are two different things, and the picker needs both — the list to choose
+from and the remaining allowance to print above it.
+
+**4. A model is chosen, and the choice is remembered.**
+
+The picker defaults to last session's model when the catalog still lists it, so pressing
+Enter repeatedly is stable instead of drifting to whatever sorts first. A fresh install
+starts on `deepseek-v4-1-flash-1017`. `ZIM_CLAUDE_MODEL` skips the picker entirely, which
+is what a script wants.
+
+**5. `claude` is `exec`ed with `ANTHROPIC_*` set for that process only.**
+
+Nothing is written to your shell profile, and nothing is exported globally. A plain
+`claude` in another terminal is untouched.
+
+### Switching models with `/model`
+
+`/model` inside Claude Code lists Claude Code's built-in lineup, which knows nothing
+about Coarena's ids. `zim-claude` fixes that by writing a `modelPicker` settings file and
+passing it with `--settings`, so `/model` lists **every model in the catalog** under its
+real name, for that session only:
+
+```
+/model
+  → Claude Opus 5.5, Claude Sonnet 5.5, DeepSeek V4.1 Flash 1017,
+    Gemini 4 Argon, Kimi K3, Grok 4.7, Qwen3.8-2.4T-A95B, …
+```
+
+Three details worth knowing:
+
+* **Nothing is written to `~/.claude/settings.json`.** These models only exist while
+  routed through Coarena, so a plain `claude` in another terminal must not inherit them.
+  The file lives at `~/.local/share/zim-claude/claude-settings.json`.
+* **Your own `--settings` wins.** If you pass one, the wrapper steps aside and says so.
+* **`ZIM_CLAUDE_NO_PICKER=1`** turns the whole thing off — including on a machine that
+  has already run once and left a settings file behind.
+
+Claude Code's own gateway discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) is
+*not* used, deliberately: it keeps only ids containing `claude` or `anthropic`, which
+would hide every non-Claude model in the catalog — 12 of the 18 at the time of writing.
+
+### The context window, and why it needs two settings
+
+This is the least obvious part of the integration, and getting it wrong is silent until
+a long session dies.
+
+Claude Code ships a catalog of the models it knows. Every Coarena id that is not a
+Claude id — `deepseek-v4-1-flash-1017`, `kimi-k3`, `grok-4-7` and the rest — is **not in
+that catalog**. For an unknown model Claude Code does not refuse to run; it guesses, and
+its guess is a **1M-token window**. Coarena's models are **128k**. That guess is eight
+times too generous, and the consequence is not cosmetic: auto-compact waits for 1M
+tokens of history before it fires, so the request hits Coarena's real 128k limit and
+**400s on length long before compaction ever runs**. The session dies instead of
+compacting.
+
+On top of that, every run printed a warning:
+
+```
+Claude Code doesn't recognize the model "deepseek-v4-1-flash-1017", so it assumes a
+context window of 1m tokens.
+```
+
+Two separate settings fix the two separate halves of this, and **neither one alone is
+enough**:
+
+| Setting | What it fixes | What it does not |
+|---|---|---|
+| `behavesAs` on the `modelPicker` row | the warning, and the client-side handling (prompt profile, capability and effort defaults) | the window — it inherits the borrowed model's 200k |
+| `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | the window Claude Code actually plans against | the warning |
+
+So the wrapper does both. Each non-Claude row gets `"behavesAs": "claude-sonnet-4-5"` —
+a stable id, and the closest match for a general tool-calling model — and
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to the **catalog's own `context_length`** for
+the model you picked, not to a number hardcoded in the wrapper. If Coarena changes a
+model's window, the wrapper follows it on the next run.
+
+Claude ids (`claude-opus-5-5`, `claude-sonnet-5-5`, …) are left alone on both counts:
+Claude Code already knows them, so overriding their handling would be a downgrade.
+
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is *not* the lever here, though it looks like one. It
+silences the prose but leaves the 1M assumption in place and still emits the
+`[claude-code:unrecognized_model]` telemetry line.
+
+The result is a session that is quiet and correctly bounded:
+
+```
+$ zim-claude -p "/context"
+## Context Usage
+**Model:** deepseek-v4-1-flash-1017
+**Tokens:** 20.5k / 128k (16%)
+```
+
+### The default model
+
+A fresh install starts on **DeepSeek V4.1 Flash 1017** — the fastest tool-capable entry
+in the catalog. It is a speed choice, not a cost one: every model on Coarena is free per
+token. For heavier agentic work, `/model` to `claude-sonnet-5-5` or `claude-opus-5-5`.
+
+### Keys from other providers are refused
+
+A key from a provider this package no longer routes to cannot work, and sending it to
+Coarena would read as "your key is broken". The wrapper names the real reason instead:
 
 | Situation | What happens |
 |---|---|
-| No TokenHarbor key configured | one line on stderr every run: `Token Juice is currently down — its unlimited quota ended.` |
-| First run, terminal available | `Use TokenHarbor instead? [y/N]`; a yes is remembered |
-| No terminal (script, CI) | exits 2 and names `ZIM_CLAUDE_USE_TOKENHARBOR=1` |
-| `ZIM_CLAUDE_API_KEY` holds a `tj_…` key | refused — it cannot work, so it is never sent anywhere |
-| `ZIM_CLAUDE_BASE_URL` names Token Juice | refused, with the reason |
-| `ZIM_CLAUDE_USE_TOKENHARBOR=0` | refused, with the reason |
+| `ZIM_CLAUDE_API_KEY` holds a `tj_…` key | refused — Token Juice is no longer a route |
+| `ZIM_CLAUDE_API_KEY` holds a `thk_…` key | refused — TokenHarbor is no longer a route |
+| `ZIM_CLAUDE_BASE_URL` names either | refused, with the reason |
+| No key anywhere, terminal available | prompts once, then caches it |
+| No key anywhere, no terminal | exits 2 and names `ZIM_CLAUDE_API_KEY` |
 
-The revoked key still sits in `config/token`, kept as a marker so nobody goes looking for
-it — but **nothing loads it any more**: not the installer, not the wrapper, not the Windows
-port. `tests/run-tests.sh` fails if a loader comes back.
+The old shared Token Juice key still sits in `config/token`, kept as a marker so nobody
+goes looking for it — but **nothing loads it any more**: not the installer, not the
+wrapper, not the Windows port. `tests/run-tests.sh` fails if a loader comes back.
 
-Say yes once and the choice is remembered in `~/.local/share/zim-claude/route`, so later
-runs go straight to TokenHarbor without a question. The notice stops as soon as a key of
-your own is configured.
+### The LiteLLM proxy is optional and unrelated
 
-**An install from the Token Juice era carries itself over.** The wrapper's background
-auto-update pulls this version and re-installs it, so the notice and the TokenHarbor offer
-appear from the next run — no manual upgrade step.
-
-### Get a TokenHarbor key
-
-1. Create one at [tokenharbor.ai/dashboard/api-keys](https://tokenharbor.ai/dashboard/api-keys).
-   New key drops and announcements land in the [Discord](https://discord.gg/7dDwHj6fxf).
-2. Either paste it at the first prompt — it is cached at
-   `~/.local/share/zim-claude/tokenharbor.key` (mode 600) — or export
-   `ZIM_CLAUDE_API_KEY=thk_…` and keep it in your shell profile.
-3. Free routes carry a `:free` suffix and are offered first. Pin one with
-   `ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free` to skip the picker.
+`install.sh` still installs the LiteLLM proxy and its `~/tokenjuice/` config, because
+other harnesses on the machine may use it. `zim-claude` itself does not touch it: there
+is no proxy in the path, and the wrapper never reads `~/tokenjuice/`.
 
 ---
 
@@ -107,14 +241,12 @@ win-install.bat</code></pre>
 
 That's it. Open a new terminal and run `zim-claude`.
 
-The installer no longer asks for a Token Juice key — that route is dead, and the shared
-key was revoked. It installs the command, records the checkout for auto-update, and leaves
-`~/tokenjuice/` exactly as it found it. Run `zim-claude` and it offers TokenHarbor (see
-[Token Juice is down](#token-juice-is-down); new keys are announced in the
-[Discord](https://discord.gg/7dDwHj6fxf)).
+The installer does not ask for a Coarena key — it installs the command, records the
+checkout for auto-update, and leaves `~/tokenjuice/` exactly as it found it. Run
+`zim-claude` and it asks for a key once, then caches it (see [Coarena](#coarena)).
 
-If you want the optional LiteLLM proxy route — for another harness on the machine, or
-because you have a Token Juice key of your own — pass it in:
+If you want the optional LiteLLM proxy route for another harness on the machine, pass a
+key in:
 
 ```bash
 ZIM_CLAUDE_TOKEN=tj_… ./install.sh
@@ -124,7 +256,7 @@ ZIM_CLAUDE_TOKEN=tj_… ./install.sh
 
 | Installer | Platform | What it sets up | Run it with |
 |---|---|---|---|
-| `install.sh` | Linux · macOS · WSL | the `zim-claude` command (TokenHarbor) + the optional CLI proxy | `./install.sh` |
+| `install.sh` | Linux · macOS · WSL | the `zim-claude` command (Coarena) + the optional CLI proxy | `./install.sh` |
 | `windows\win-install.bat` | Windows | `zim-claude`, plus the optional CLI proxy *and* the `:4002` desktop gateway | `win-install.bat` |
 | `claude-desktop-integration/install.sh` | Linux · macOS | the `:4002` gateway only | `cd claude-desktop-integration && ./install.sh` |
 
@@ -206,8 +338,8 @@ directory to `PATH`.)
 | `~/tokenjuice/source` | the optional proxy's env profile — Token Juice key + base URL + model (mode 600); only written when you pass `ZIM_CLAUDE_TOKEN` |
 | `~/tokenjuice/litellm-config.yaml` | LiteLLM proxy config: which model name maps to which upstream |
 | `~/.local/share/zim-claude/venv/` | the proxy's private virtualenv (litellm + uvloop) |
-| `~/.local/share/zim-claude/route` | the remembered TokenHarbor choice |
-| `~/.local/share/zim-claude/tokenharbor.key` | your TokenHarbor key, cached after the first prompt (mode 600) |
+| `~/.local/share/zim-claude/coarena.key` | your Coarena key, cached after the first prompt (mode 600) |
+| `~/.local/share/zim-claude/claude-settings.json` | the `modelPicker` file that puts the whole catalog in `/model` (mode 600) |
 | `~/.local/share/zim-claude/last-model` | the model you picked last time — the picker's default |
 | `~/.local/share/zim-claude/update.conf` | which checkout and branch the updater tracks |
 | `~/.local/share/zim-claude/update.log` | what the updater did, last few hundred KB |
@@ -351,7 +483,7 @@ updated, already current, dirty, diverged, fetch failed — is a line there.
 Windows gets its own installer under `windows/`. It is **native** — no WSL, no Git Bash,
 no Node, and no Administrator rights.
 
-`zim-claude` itself routes straight to TokenHarbor here too — the proxies below are the
+`zim-claude` itself routes straight to Coarena here too — the proxies below are the
 optional LiteLLM route, and one installer sets up **both** of them because on Windows
 they are usually wanted together:
 
@@ -415,7 +547,7 @@ execution policy blocks it anyway). `start-proxies.cmd` is what makes the plain
 command work: it passes `-ExecutionPolicy Bypass` for that one invocation, so your
 machine's policy is untouched. Every `.ps1` here has such a shim for the same reason.
 
-You normally never need these: on Windows too, `zim-claude` itself talks to TokenHarbor
+You normally never need these: on Windows too, `zim-claude` itself talks to Coarena
 and never starts or health-checks these proxies. They are the optional LiteLLM route.
 
 Windows gets the same auto-update as Linux: `zim-claude` starts
@@ -555,10 +687,9 @@ Windows, use the in-app dialog above.
 
 ## The LiteLLM proxy (optional)
 
-This is **not** what `zim-claude` uses any more — the wrapper talks to TokenHarbor
-directly. The proxy is here for other harnesses on the machine, and for anyone running a
-Token Juice key of their own; `install.sh --start` starts it, and `start-litellm.sh`
-manages it:
+This is **not** what `zim-claude` uses — the wrapper talks to Coarena directly. The proxy
+is here for other harnesses on the machine, and for anyone running a Token Juice key of
+their own; `install.sh --start` starts it, and `start-litellm.sh` manages it:
 
 ```bash
 start-litellm.sh status     # is it running?
@@ -588,19 +719,24 @@ through environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ZIM_CLAUDE_API_KEY` | (unset) | your TokenHarbor key; skips the prompt and is never cached (`TOKENHARBOR_API_KEY` works too) |
-| `ZIM_CLAUDE_MODEL` | (picker) | pin a model id, e.g. `deepseek-v4.1-flash:free` |
-| `ZIM_CLAUDE_BASE_URL` | `https://tokenharbor.ai` | the API host; naming Token Juice is refused |
-| `ZIM_CLAUDE_USE_TOKENHARBOR` | (ask once) | `1` = take TokenHarbor without asking, `0` = refuse |
+| `ZIM_CLAUDE_API_KEY` | (unset) | your Coarena key; skips the prompt and is never cached (`COARENA_API_KEY` works too) |
+| `ZIM_CLAUDE_MODEL` | `deepseek-v4-1-flash-1017` | pin a model id to skip the picker |
+| `ZIM_CLAUDE_BASE_URL` | `https://coarena.ai/api` | the API host; naming an old provider is refused |
 | `ZIM_CLAUDE_BIN` | `claude` on `PATH` | which claude to run |
-| `ZIM_CLAUDE_STATE_DIR` | `~/.local/share/zim-claude` | route, cached key and last pick |
+| `ZIM_CLAUDE_STATE_DIR` | `~/.local/share/zim-claude` | cached key, last pick and the settings file |
+| `ZIM_CLAUDE_NO_PICKER` | `0` | set to `1` to leave `/model` alone (and stop passing `--settings`) |
 | `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
+
+`zim-claude` also sets two variables for the `claude` process it starts, both derived
+from the catalog rather than hardcoded: `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (the model's
+real `context_length`) and, inside the settings file, `behavesAs` on each non-Claude
+row. See [the context window](#the-context-window-and-why-it-needs-two-settings).
 
 Scripted use — no prompts at all:
 
 ```bash
-ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_… \
-ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free zim-claude -p "explain this function"
+ZIM_CLAUDE_API_KEY=coa_… ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
+  zim-claude -p "explain this function"
 ```
 
 <details>
@@ -626,19 +762,36 @@ ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free zim-claude -p "explain this function"
 
 ## Troubleshooting
 
-**It says `Token Juice is currently down — its unlimited quota ended`.**
-That is the intended notice, printed once on stderr until a key of your own is configured.
-Answer `y` to the TokenHarbor offer, or set `ZIM_CLAUDE_USE_TOKENHARBOR=1` and a
-`ZIM_CLAUDE_API_KEY` for scripted use.
+**It asks for a Coarena API key.**
+That is the first-run prompt. Paste a key from
+[coarena.ai/account/api](https://coarena.ai/account/api) and it is cached at
+`~/.local/share/zim-claude/coarena.key` (mode 600) — you are not asked again.
 
 **It exits 2 saying there is no terminal to ask on.**
 Prompts need a TTY. In a script, CI or a piped install, say what you want up front:
-`ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_…`.
+`ZIM_CLAUDE_API_KEY=coa_… ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017`.
 
-**`that is a Token Juice key (tj_…), and Token Juice is down`.**
-`ZIM_CLAUDE_API_KEY` (or the cached key) holds a `tj_…` key. It cannot work on this route,
-so it is refused rather than sent to TokenHarbor and reported as a bad key. Create a
-TokenHarbor key instead.
+**`that is a Token Juice key (tj_…)` / `that is a TokenHarbor key (thk_…)`.**
+`ZIM_CLAUDE_API_KEY` (or the cached key) holds a key from a provider this package no
+longer routes to. It cannot work on Coarena, so it is refused rather than sent and
+reported as a bad key. Create a Coarena key instead.
+
+**`/model` does not list the Coarena models.**
+Either you passed your own `--settings` (the wrapper steps aside and says so), or
+`ZIM_CLAUDE_NO_PICKER=1` is set. Check `~/.local/share/zim-claude/claude-settings.json`
+exists and is valid JSON.
+
+**It prints `Claude Code doesn't recognize the model "…"`.**
+That warning means the `behavesAs` row did not reach Claude Code — usually because you
+passed your own `--settings`, which replaces the wrapper's file wholesale. The session
+still works, but Claude Code is assuming a 1M-token window instead of the model's real
+one, so a long session will 400 on length before auto-compact fires. Either drop your
+`--settings` or add `behavesAs` to your own `modelPicker` rows.
+
+**A long session dies with a length error instead of compacting.**
+Same cause: the window Claude Code planned against was too large. Check that
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set in the session (`/context` shows the window it
+is using) and that the catalog still advertises a `context_length` for the model.
 
 **It warns `ignoring inherited ANTHROPIC_BASE_URL=...`.**
 Your shell exports an `ANTHROPIC_BASE_URL` — often the old `~/tokenjuice/source` profile

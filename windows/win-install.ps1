@@ -319,7 +319,8 @@ function Install-EnvProfile {
   # a scripted install. Nothing is read from this checkout any more: Token
   # Juice's unlimited quota ended, so the key file that ships in it is
   # deliberately not loaded, and a missing key is NOT an error - the wrapper
-  # offers TokenHarbor instead. Trims surrounding whitespace, including the CR a
+  # routes to Coarena and asks for its own key on first run. Trims surrounding
+  # whitespace, including the CR a
   # browser copy-paste adds - a trailing CR inside the export produces a 401
   # that looks like a bad key.
   $token = ''
@@ -376,16 +377,16 @@ function Install-EnvProfile {
   if ($port -eq 0) { $port = Select-ProxyPort -Token $token }
 
   if ([string]::IsNullOrEmpty($token)) {
-    # No credential anywhere. Not an error any more: Token Juice is down, the
-    # wrapper offers TokenHarbor on first run, and anyone who wants the proxy
-    # route can set ZIM_CLAUDE_TOKEN=tj_... and re-run. Returning success
-    # matters - the background updater runs this with no console to prompt on.
+    # No credential anywhere. Not an error any more: the proxy is optional and
+    # the wrapper asks for its own Coarena key on first run. Anyone who wants
+    # the proxy route can set ZIM_CLAUDE_TOKEN=tj_... and re-run. Returning
+    # success matters - the background updater runs this with no console.
     if ($DryRun) {
       Write-Host "    would skip the credential profile (Token Juice is down)"
       return $true
     }
     Write-Say "no Token Juice key in $EnvFile or ZIM_CLAUDE_TOKEN - skipping the profile"
-    Write-Say "  (Token Juice is down; zim-claude will offer TokenHarbor instead)"
+    Write-Say "  (the proxy profile is optional; zim-claude itself routes to Coarena)"
     return $true
   }
 
@@ -848,11 +849,12 @@ if ($script:PrereqFailed) {
 Write-Ok "done. Try:  zim-claude --version"
 
 Write-Host ''
-Write-Warn "Token Juice is down: its unlimited quota ended."
-Write-Say "  zim-claude no longer routes to it. Run zim-claude and it will offer"
-Write-Say "  TokenHarbor (https://tokenharbor.ai) instead; your answer is remembered."
-Write-Say "  The proxy route above stays installed for other harnesses and for anyone"
-Write-Say "  with a Token Juice key of their own."
+Write-Say "zim-claude routes to Coarena (https://coarena.ai)."
+Write-Say "  Run zim-claude and it will ask for a Coarena API key once, then save it"
+Write-Say "  to $StateDir\coarena.key (mode 600). Create one at"
+Write-Say "  https://coarena.ai/account/api."
+Write-Say "  The LiteLLM proxy above is optional and unrelated: it stays installed for"
+Write-Say "  other harnesses on this machine."
 
 if (-not $NoStart) {
   Write-Host ''

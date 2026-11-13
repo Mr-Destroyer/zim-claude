@@ -127,7 +127,7 @@ else pass "no --break-system-packages advice remains"; fi
 
 # The public Token Juice key stays in the tree — it is public by design — but
 # it must not be loaded anywhere any more: the unlimited quota ended and
-# zim-claude routes to TokenHarbor. Any OTHER live-looking key is still a leak.
+# zim-claude routes to Coarena. Any OTHER live-looking key is still a leak.
 if [[ -f "$REPO/config/token" ]] && \
    grep -qxE 'tj_[A-Za-z0-9_-]{16,}' "$REPO/config/token"; then
   pass "the public key still ships in config/token"
@@ -155,15 +155,35 @@ if hits="$(grep -rnE '(tj|lfu|thk)_[A-Za-z0-9_-]{16,}' "$REPO" \
   fail "no other live API key is committed" "$hits"
 else pass "no other live API key is committed"; fi
 
-# Token Juice is down; the wrapper runs against TokenHarbor and says so on
-# every run until the user has a key of their own.
-if grep -qF 'https://tokenharbor.ai' "$REPO/scripts/zim-claude" &&
-   grep -qF 'unlimited quota ended' "$REPO/scripts/zim-claude" &&
-   grep -qF 'ZIM_CLAUDE_USE_TOKENHARBOR' "$REPO/scripts/zim-claude"; then
-  pass "the wrapper targets TokenHarbor and carries the outage notice"
+# The wrapper routes to Coarena, and the base URL is the Messages root rather
+# than /api/v1: the SDK appends /v1/messages itself.
+if grep -qF 'https://coarena.ai/api' "$REPO/scripts/zim-claude" &&
+   grep -qF 'coarena.ai/account/api' "$REPO/scripts/zim-claude" &&
+   grep -qF 'deepseek-v4-1-flash-1017' "$REPO/scripts/zim-claude"; then
+  pass "the wrapper targets Coarena and defaults to deepseek"
 else
-  fail "the wrapper targets TokenHarbor and carries the outage notice" \
-       "expected https://tokenharbor.ai, 'unlimited quota ended' and ZIM_CLAUDE_USE_TOKENHARBOR"
+  fail "the wrapper targets Coarena and defaults to deepseek" \
+       "expected https://coarena.ai/api, the key page and the default model"
+fi
+
+# The credential probe must be /v1/limits, not /v1/models: the catalog answers
+# 200 with no key at all, so probing it would accept any string.
+if grep -qF 'api_get /v1/limits' "$REPO/scripts/zim-claude"; then
+  pass "the wrapper probes /v1/limits for the credential"
+else
+  fail "the wrapper probes /v1/limits for the credential" \
+       "a /v1/models probe cannot tell a good key from a missing one"
+fi
+
+# /model gets the whole catalog through a modelPicker settings file, because
+# Claude Code's own gateway discovery keeps only ids containing claude/anthropic.
+if grep -qF 'modelPicker' "$REPO/scripts/zim-claude" &&
+   grep -qF 'replaceBuiltInOptions' "$REPO/scripts/zim-claude" &&
+   grep -qF -- '--settings' "$REPO/scripts/zim-claude"; then
+  pass "the wrapper writes a modelPicker settings file"
+else
+  fail "the wrapper writes a modelPicker settings file" \
+       "expected modelPicker, replaceBuiltInOptions and --settings"
 fi
 
 # ------------------------------------------------------------- windows ------
@@ -207,15 +227,21 @@ else
   pass "zim-claude.ps1 no longer manages the proxy"
 fi
 
-# The Windows wrapper carries the same outage notice and opt-in as the bash one,
-# and must not read the Token Juice profile or the shipped key.
-if grep -qF 'unlimited quota ended' "$REPO/windows/zim-claude.ps1" &&
-   grep -qF 'ZIM_CLAUDE_USE_TOKENHARBOR' "$REPO/windows/zim-claude.ps1" &&
-   grep -qF 'https://tokenharbor.ai' "$REPO/windows/zim-claude.ps1"; then
-  pass "zim-claude.ps1 carries the outage notice and the TokenHarbor opt-in"
+# The Windows wrapper routes to the same place as the bash one, with the same
+# default model and the same /model mechanism.
+if grep -qF 'https://coarena.ai/api' "$REPO/windows/zim-claude.ps1" &&
+   grep -qF 'deepseek-v4-1-flash-1017' "$REPO/windows/zim-claude.ps1" &&
+   grep -qF 'modelPicker' "$REPO/windows/zim-claude.ps1"; then
+  pass "zim-claude.ps1 targets Coarena with the same default and picker"
 else
-  fail "zim-claude.ps1 carries the outage notice and the TokenHarbor opt-in" \
-       "expected the notice, ZIM_CLAUDE_USE_TOKENHARBOR and https://tokenharbor.ai"
+  fail "zim-claude.ps1 targets Coarena with the same default and picker" \
+       "expected https://coarena.ai/api, the default model and modelPicker"
+fi
+if grep -qF '/v1/limits' "$REPO/windows/zim-claude.ps1"; then
+  pass "zim-claude.ps1 probes /v1/limits for the credential"
+else
+  fail "zim-claude.ps1 probes /v1/limits for the credential" \
+       "a /v1/models probe cannot tell a good key from a missing one"
 fi
 if grep -qF 'tokenjuice\source' "$REPO/windows/zim-claude.ps1" 2>/dev/null ||
    grep -qF 'LITELLM_ENV_FILE' "$REPO/windows/zim-claude.ps1" 2>/dev/null; then
@@ -561,12 +587,15 @@ section "a fresh install does not load the shipped key"
 # The public key still ships in config/token (it is public by design), but the
 # unlimited quota ended: nothing may load it any more. With no profile, no
 # terminal and no ZIM_CLAUDE_TOKEN, the installer must skip the credential and
-# carry on — the wrapper offers TokenHarbor instead.
+# carry on — the wrapper asks for its own Coarena key on first run.
 AUTOKEY_SBX="$(mktemp -d "${TMPDIR:-/tmp}/zim-test-autokey-XXXXXX")"
 out="$(env -i HOME="$AUTOKEY_SBX" PATH="$STUB_BIN:/usr/bin:/bin" TERM=dumb \
   bash "$REPO/install.sh" </dev/null 2>&1)"
 assert_contains "the shipped key is not used" "skipping the profile" "$out"
-assert_contains "the outage is named" "Token Juice is down" "$out"
+# The skip must say what to do instead, and must not send the user to a route
+# this package no longer has.
+assert_contains "the skip names the Coarena route" "routes to Coarena" "$out"
+assert_lacks "the skip does not advertise TokenHarbor" "TokenHarbor" "$out"
 [[ -e "$AUTOKEY_SBX/tokenjuice/source" ]] \
   && fail "no profile is invented from config/token" "a profile was written" \
   || pass "no profile is invented from config/token"
@@ -687,23 +716,44 @@ section "argument pass-through"
 
 ZC="$SBX/.local/bin/zim-claude"
 
-# The wrapper calls curl for /v1/models. A stub answers from ZC_STATUS /
-# ZC_MODELS, so no test needs the network. It lives in its own bin dir: the
-# installer's stub answers port probes with a bare status code and no body.
+# The wrapper calls curl twice: /v1/limits (the credential probe) and
+# /v1/models (the catalog). A stub answers both from ZC_STATUS / ZC_MODELS, so
+# no test needs the network. It lives in its own bin dir: the installer's stub
+# answers port probes with a bare status code and no body.
 ZCURL="$SBX/zcbin"
 mkdir -p "$ZCURL"
 cat > "$ZCURL/curl" <<'EOF'
 #!/usr/bin/env bash
 # Test stub for curl. Deliberately avoids ${VAR:-{...}} defaults: bash ends
 # such an expansion at the first unescaped '}', truncating a JSON default.
+#
+# The wrapper asks for /v1/limits first and /v1/models second, and the two
+# answer different shapes. ZC_LIMITS_STATUS / ZC_MODELS_STATUS let a test fail
+# one without the other; both default to ZC_STATUS.
+url=""
+for a in "$@"; do url="$a"; done
 code="${ZC_STATUS:-200}"
 body=""
-if [[ "$code" == "200" ]]; then
-  body="${ZC_MODELS}"
-  if [[ -z "$body" ]]; then
-    body='{"object":"list","data":[{"id":"claude-opus-5.5"},{"id":"deepseek-v4.1-flash:free"},{"id":"mimo-v2.6-flash:free"},{"id":"th-rudder"},{"id":"gpt-6-astra"}]}'
-  fi
-fi
+case "$url" in
+  */v1/limits)
+    code="${ZC_LIMITS_STATUS:-$code}"
+    if [[ "$code" == "200" ]]; then
+      body="${ZC_LIMITS}"
+      if [[ -z "$body" ]]; then
+        body='{"data":{"free":true,"usd_per_day":5,"today":{"used_usd":0.43,"left_usd":4.57}}}'
+      fi
+    fi
+    ;;
+  */v1/models)
+    code="${ZC_MODELS_STATUS:-$code}"
+    if [[ "$code" == "200" ]]; then
+      body="${ZC_MODELS}"
+      if [[ -z "$body" ]]; then
+        body='{"object":"list","data":[{"id":"claude-opus-5-5","display_name":"Claude Opus 5.5","context_length":128000},{"id":"claude-sonnet-5-5","display_name":"Claude Sonnet 5.5","context_length":128000},{"id":"deepseek-v4-1-flash-1017","display_name":"DeepSeek V4.1 Flash 1017","context_length":128000},{"id":"gemini-4-argon","display_name":"Gemini 4 Argon","context_length":128000},{"id":"kimi-k3","display_name":"Kimi K3","context_length":128000}]}'
+      fi
+    fi
+    ;;
+esac
 printf '%s' "$body"
 printf '\n%s' "$code"
 EOF
@@ -711,151 +761,143 @@ chmod +x "$ZCURL/curl"
 
 ZSTATE="$SBX/zstate"
 # stderr is dropped here (and asserted separately where it matters) so the
-# wrapper's advisory warnings don't clutter the test log. ZC_OPTIN defaults to
-# 1 so these tests exercise the route without an interactive prompt.
+# wrapper's advisory warnings don't clutter the test log.
 run_zc() { env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY="${ZC_KEY-thk_live_TESTKEY}" \
-  ZIM_CLAUDE_MODEL="${ZC_MODEL-deepseek-v4.1-flash:free}" \
-  ZIM_CLAUDE_USE_TOKENHARBOR="${ZC_OPTIN-1}" \
+  ZIM_CLAUDE_API_KEY="${ZC_KEY-coa_live_TESTKEY}" \
+  ZIM_CLAUDE_MODEL="${ZC_MODEL-deepseek-v4-1-flash-1017}" \
   "$ZC" "$@" 2>/dev/null; }
 
 out="$(run_zc)"
-assert_eq "no args -> ARGC=0" "ARGC=0" "$(head -1 <<<"$out")"
+assert_eq "no args -> ARGC=2 (the --settings pair)" "ARGC=2" "$(head -1 <<<"$out")"
 
 out="$(run_zc --dangerously-skip-permissions)"
-assert_eq "--dangerously-skip-permissions -> ARGC=1" "ARGC=1" "$(head -1 <<<"$out")"
-assert_contains "  ...forwarded verbatim" "[1]=<--dangerously-skip-permissions>" "$out"
+assert_eq "--dangerously-skip-permissions -> ARGC=3" "ARGC=3" "$(head -1 <<<"$out")"
+assert_contains "  ...forwarded verbatim" "[3]=<--dangerously-skip-permissions>" "$out"
 
 out="$(run_zc mcp add "my server" --command "npx -y foo bar")"
-assert_eq "mcp add with spaces -> ARGC=5" "ARGC=5" "$(head -1 <<<"$out")"
-assert_contains "  ...positional name with space preserved" "[3]=<my server>" "$out"
-assert_contains "  ...embedded-space command preserved" "[5]=<npx -y foo bar>" "$out"
+assert_eq "mcp add with spaces -> ARGC=7" "ARGC=7" "$(head -1 <<<"$out")"
+assert_contains "  ...positional name with space preserved" "[5]=<my server>" "$out"
+assert_contains "  ...embedded-space command preserved" "[7]=<npx -y foo bar>" "$out"
 
 out="$(run_zc -- --not-a-flag)"
-assert_eq "-- separator -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
-assert_contains "  ...-- forwarded literally" "[1]=<-->" "$out"
+assert_eq "-- separator -> ARGC=4" "ARGC=4" "$(head -1 <<<"$out")"
+assert_contains "  ...-- forwarded literally" "[3]=<-->" "$out"
 
 out="$(run_zc "" x)"
-assert_eq "empty string arg -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
-assert_contains "  ...empty arg preserved" "[1]=<>" "$out"
+assert_eq "empty string arg -> ARGC=4" "ARGC=4" "$(head -1 <<<"$out")"
+assert_contains "  ...empty arg preserved" "[3]=<>" "$out"
 
 out="$(run_zc "$(printf 'a\nb')" 'c"d')"
-assert_eq "newline/quote args -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
-assert_contains "  ...newline preserved" "[1]=<a" "$out"
+assert_eq "newline/quote args -> ARGC=4" "ARGC=4" "$(head -1 <<<"$out")"
+assert_contains "  ...newline preserved" "[3]=<a" "$out"
 
 out="$(run_zc mcp list)"
-assert_eq "mcp list -> ARGC=2" "ARGC=2" "$(head -1 <<<"$out")"
-assert_contains "  ...subcommand forwarded" "[1]=<mcp>" "$out"
+assert_eq "mcp list -> ARGC=4" "ARGC=4" "$(head -1 <<<"$out")"
+assert_contains "  ...subcommand forwarded" "[3]=<mcp>" "$out"
 
 section "environment handling"
 
 out="$(run_zc --version)"
-assert_contains "TokenHarbor base url reaches claude" "BASE_URL=https://tokenharbor.ai" "$out"
-assert_contains "the chosen model reaches claude" "MODEL=deepseek-v4.1-flash:free" "$out"
+assert_contains "Coarena base url reaches claude" "BASE_URL=https://coarena.ai/api" "$out"
+assert_contains "the chosen model reaches claude" "MODEL=deepseek-v4-1-flash-1017" "$out"
 assert_contains "auth token exported" "TOKEN_SET=yes" "$out"
 assert_contains "ANTHROPIC_API_KEY is empty" "APIKEY=<>" "$out"
 assert_contains "every Anthropic tier is pinned to the chosen model" \
-  "TIERS=deepseek-v4.1-flash:free|deepseek-v4.1-flash:free|deepseek-v4.1-flash:free|deepseek-v4.1-flash:free" "$out"
+  "TIERS=deepseek-v4-1-flash-1017|deepseek-v4-1-flash-1017|deepseek-v4-1-flash-1017|deepseek-v4-1-flash-1017" "$out"
 
-# An inherited Token Juice route is the one thing this package must never pick
-# back up: the proxy is gone from the wrapper, so the stale value is reported
-# and replaced rather than followed.
+# The base URL is the Messages root, not /api/v1: the SDK appends /v1/messages
+# itself, so /api/v1 would compose to /api/v1/v1/messages and 404 every turn.
+assert_lacks "the base url is not the /api/v1 root" "BASE_URL=https://coarena.ai/api/v1" "$out"
+
+# An inherited route from a provider this package no longer supports is
+# reported and replaced rather than followed.
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  ANTHROPIC_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>/dev/null)"
-assert_contains "an inherited Token Juice base url is not used" "BASE_URL=https://tokenharbor.ai" "$out"
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
+  ANTHROPIC_BASE_URL="https://tokenharbor.ai" "$ZC" --version 2>/dev/null)"
+assert_contains "an inherited TokenHarbor base url is not used" "BASE_URL=https://coarena.ai/api" "$out"
 
 err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  ANTHROPIC_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>&1 >/dev/null)"
-assert_contains "the dropped Token Juice route is reported" \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
+  ANTHROPIC_BASE_URL="https://tokenharbor.ai" "$ZC" --version 2>&1 >/dev/null)"
+assert_contains "the dropped inherited route is reported" \
   "ignoring inherited ANTHROPIC_BASE_URL" "$err"
 
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
   ANTHROPIC_API_KEY="sk-a-real-looking-key" "$ZC" --version 2>/dev/null)"
 assert_contains "inherited API key is cleared" "APIKEY=<>" "$out"
 
 # set -a must not leak: only names the wrapper assigns are touched.
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
   ZIM_TEST_UNRELATED="untouched" "$ZC" --version 2>/dev/null)"
 assert_contains "unrelated env var survives" "UNRELATED=untouched" "$out"
 
-section "the Token Juice notice"
-
-NSTATE="$SBX/state-notice"
-notice_zc() { env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$NSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  "$ZC" --version </dev/null; }
-
-err="$(notice_zc 2>&1 >/dev/null)"
-assert_eq "no key and no answer exits 2" "2" "$?"
-assert_contains "the notice names Token Juice" "Token Juice is currently down" "$err"
-assert_contains "the notice says the quota ended" "unlimited quota ended" "$err"
-assert_contains "the notice points at the opt-in" "ZIM_CLAUDE_USE_TOKENHARBOR=1" "$err"
-
-# The notice is a line on stderr, never a reason to block a working session:
-# with a key configured there is nothing to report.
-KSTATE="$SBX/state-keyed"
-mkdir -p "$KSTATE"
-printf 'thk_live_CACHED\n' > "$KSTATE/tokenharbor.key"
-chmod 600 "$KSTATE/tokenharbor.key"
-out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$KSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>/dev/null)"
-assert_contains "a cached key is used without a prompt" "TOKEN_SET=yes" "$out"
-
-err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$KSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>&1 >/dev/null)"
-if [[ "$err" == *"Token Juice is currently down"* ]]; then
-  fail "the notice stops once a key is configured" "still printed: $err"
-else pass "the notice stops once a key is configured"; fi
+section "the API key"
 
 # A key from the environment is the user's, not ours to keep on disk.
-[[ -e "$ZSTATE/tokenharbor.key" ]] \
-  && fail "an environment key is never cached" "$ZSTATE/tokenharbor.key exists" \
+rm -rf "$ZSTATE"
+run_zc --version >/dev/null 2>&1
+[[ -e "$ZSTATE/coarena.key" ]] \
+  && fail "an environment key is never cached" "$ZSTATE/coarena.key exists" \
   || pass "an environment key is never cached"
 
-section "the TokenHarbor opt-in"
-
-# =1 skips the question and remembers the answer...
-OSTATE="$SBX/state-optin"
+# A key typed at the prompt IS cached, mode 600, so the prompt is a first-run
+# cost rather than a per-session tax.
+KSTATE="$SBX/state-keyed"
+mkdir -p "$KSTATE"
+printf 'coa_live_CACHED\n' > "$KSTATE/coarena.key"
+chmod 600 "$KSTATE/coarena.key"
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 "$ZC" --version 2>/dev/null)"
-assert_contains "the opt-in runs against TokenHarbor" "BASE_URL=https://tokenharbor.ai" "$out"
-assert_contains "the opt-in is remembered" "tokenharbor" "$(cat "$OSTATE/route" 2>/dev/null)"
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$KSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 "$ZC" --version 2>/dev/null)"
+assert_contains "a cached key is used without a prompt" "TOKEN_SET=yes" "$out"
 
-# ...so the next run needs neither the variable nor a prompt.
+# COARENA_API_KEY is accepted as an alias for ZIM_CLAUDE_API_KEY.
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  COARENA_API_KEY=coa_live_ALIAS ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
   "$ZC" --version 2>/dev/null)"
-assert_contains "a remembered opt-in needs no variable" "BASE_URL=https://tokenharbor.ai" "$out"
+assert_contains "COARENA_API_KEY is accepted" "TOKEN_SET=yes" "$out"
 
-# =0 is a refusal: the wrapper must not fall through to anything.
+section "keys from other providers are refused"
+
+# A key from a provider this package no longer routes to cannot work, and
+# sending it to Coarena would read as "your key is broken".
 err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$OSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=deepseek-v4.1-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=0 "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "declining TokenHarbor exits 2" "2" "$?"
-assert_contains "declining still reports the outage" "Token Juice is down" "$err"
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=tj_live_OLD ZIM_CLAUDE_MODEL=x "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "a Token Juice key is refused" "2" "$?"
+assert_contains "the refusal names the key type" "Token Juice key" "$err"
 
-section "wrapper: the free-model picker"
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=thk_live_OLD ZIM_CLAUDE_MODEL=x "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "a TokenHarbor key is refused" "2" "$?"
+assert_contains "the refusal names TokenHarbor" "TokenHarbor key" "$err"
+
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=x \
+  ZIM_CLAUDE_BASE_URL="https://tokenharbor.ai" "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "pointing the base url at TokenHarbor is refused" "2" "$?"
+assert_contains "the base url refusal names the provider" "no longer routes" "$err"
+
+# Nothing in the wrapper may read the old providers' state.
+for needle in 'tokenjuice/source' 'config/token' 'LITELLM_ENV_FILE' 'tokenharbor.key'; do
+  if grep -qF -- "$needle" "$REPO/scripts/zim-claude"; then
+    fail "the wrapper does not read old provider state" "found: $needle"
+  else
+    pass "the wrapper does not read old provider state ($needle)"
+  fi
+done
+
+section "wrapper: the model picker"
 
 if command -v script >/dev/null 2>&1; then
   # zc_pty <stdin> <shell-snippet> [models-json]
@@ -865,47 +907,42 @@ if command -v script >/dev/null 2>&1; then
       script -qec "$2" /dev/null 2>&1
   }
 
-  # No key anywhere: the wrapper offers TokenHarbor, then asks for a key, then
-  # offers the free models. The pty carries all three answers.
-  out="$(zc_pty $'y\nthk_live_TYPED\n\n' \
+  # No key anywhere: the wrapper asks for one, then offers the models. The pty
+  # carries both answers.
+  out="$(zc_pty $'coa_live_TYPED\n\n' \
         "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pty ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the wrapper offers TokenHarbor" "Use TokenHarbor instead?" "$out"
-  assert_contains "a yes asks for a key" "paste it here" "$out"
+  assert_contains "a missing key is asked for" "paste it here" "$out"
   assert_contains "the typed key is accepted" "TOKEN_SET=yes" "$out"
-  assert_contains "free models are listed" "deepseek-v4.1-flash:free" "$out"
-  assert_contains "a second free model is listed" "mimo-v2.6-flash:free" "$out"
-  assert_contains "th-rudder counts as free" "th-rudder" "$out"
-  assert_lacks "a paid model is not offered" "claude-opus-5.5" "$out"
+  assert_contains "the catalog is listed" "deepseek-v4-1-flash-1017" "$out"
+  assert_contains "a second model is listed" "claude-opus-5-5" "$out"
+  assert_contains "display names are shown" "DeepSeek V4.1 Flash 1017" "$out"
+  assert_contains "the day's budget is shown" "left today" "$out"
 
-  # Declining the offer leaves nothing to run against and says why.
-  out="$(zc_pty $'n\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-decline ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "declining explains there is nothing to run" "TokenHarbor was declined" "$out"
+  # A fresh install defaults to DeepSeek V4.1 Flash: Enter takes it.
+  assert_contains "the default is deepseek" "MODEL=deepseek-v4-1-flash-1017" "$out"
+  assert_contains "the default is marked in the prompt" "select 1-5 [3]" "$out"
 
-  # The second entry selects the second free model.
-  out="$(zc_pty $'y\nthk_live_TYPED\n2\n' \
+  # The second entry selects the second model.
+  out="$(zc_pty $'coa_live_TYPED\n2\n' \
         "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the second entry is selected" "MODEL=mimo-v2.6-flash:free" "$out"
+  assert_contains "the second entry is selected" "MODEL=claude-sonnet-5-5" "$out"
 
-  # A remembered choice becomes the default, so Enter is stable. The route and
-  # the key are both remembered by now, so the empty line accepts the default.
+  # A remembered choice becomes the default, so Enter is stable.
   out="$(zc_pty $'\n' \
         "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
-  assert_contains "the last pick is remembered as the default" "select 1-3 [2]" "$out"
+  assert_contains "the last pick is remembered as the default" "select 1-5 [2]" "$out"
 
   # Nonsense is re-asked, not accepted.
   out="$(zc_pty $'9\n1\n' \
         "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-pick2 ZIM_CLAUDE_NO_UPDATE=1 $ZC --version")"
   assert_contains "an out-of-range choice is rejected" "not a choice: 9" "$out"
-  assert_contains "a valid choice still works after that" "MODEL=deepseek-v4.1-flash:free" "$out"
+  assert_contains "a valid choice still works after that" "MODEL=claude-opus-5-5" "$out"
 
-  # A catalog with no :free ids falls back to the whole list instead of
-  # refusing to start.
-  out="$(zc_pty $'\n' \
-        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-nofree ZIM_CLAUDE_NO_UPDATE=1 ZIM_CLAUDE_USE_TOKENHARBOR=1 ZIM_CLAUDE_API_KEY=thk_live_TESTKEY $ZC --version" \
-        '{"data":[{"id":"claude-opus-5.5"},{"id":"gpt-6-astra"}]}')"
-  assert_contains "a catalog with no free route says so" "no free model is advertised" "$out"
-  assert_contains "a catalog with no free route still offers models" "claude-opus-5.5" "$out"
+  # A catalog whose default is absent still starts on the first entry.
+  out="$(zc_pty $'coa_live_TYPED\n\n' \
+        "ZIM_CLAUDE_BIN=$STUB ZIM_CLAUDE_STATE_DIR=$SBX/state-nodefault ZIM_CLAUDE_NO_UPDATE=1 $ZC --version" \
+        '{"data":[{"id":"gemini-4-argon","display_name":"Gemini 4 Argon"},{"id":"kimi-k3","display_name":"Kimi K3"}]}')"
+  assert_contains "a catalog without the default falls back to the first" "MODEL=gemini-4-argon" "$out"
 else
   skip "script(1) not available — cannot drive the interactive prompts"
 fi
@@ -913,67 +950,129 @@ fi
 # A pinned model skips the picker entirely.
 out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=mimo-v2.6-flash:free \
-  ZIM_CLAUDE_USE_TOKENHARBOR=1 "$ZC" --version 2>/dev/null)"
-assert_lacks "a pinned model skips the picker" "free models on" "$out"
-assert_contains "a pinned model is used" "MODEL=mimo-v2.6-flash:free" "$out"
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  "$ZC" --version 2>/dev/null)"
+assert_lacks "a pinned model skips the picker" "models on" "$out"
+assert_contains "a pinned model is used" "MODEL=kimi-k3" "$out"
 
-section "wrapper: Token Juice cannot come back"
+section "wrapper: /model gets the whole catalog"
 
-# The shipped key is public and stays in the tree, but it must not be usable
-# through zim-claude: Token Juice's unlimited quota ended.
-TJ_KEY="$(tr -d ' \t\r\n' < "$REPO/config/token" 2>/dev/null || true)"
-err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY="$TJ_KEY" ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "the shipped Token Juice key is refused" "2" "$?"
-assert_contains "the refusal names the key type" "Token Juice key" "$err"
+# Claude Code's own gateway discovery keeps only ids containing "claude" or
+# "anthropic", which would hide 12 of Coarena's 18 models. The wrapper writes a
+# modelPicker settings file instead and passes it with --settings.
+out="$(run_zc --version)"
+assert_contains "the settings file is passed" "--settings" "$out"
+assert_contains "  ...as a path under the state dir" "$ZSTATE/claude-settings.json" "$out"
 
-err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
-  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  ZIM_CLAUDE_BASE_URL="https://api.tokenjuice.ai/v1" "$ZC" --version 2>&1 >/dev/null)"
-assert_eq "pointing the base url at Token Juice is refused" "2" "$?"
-assert_contains "the base url refusal names the quota" "unlimited quota ended" "$err"
-
-# Nothing in the wrapper may read the Token Juice profile or the shipped key.
-for needle in 'tokenjuice/source' 'config/token' 'LITELLM_ENV_FILE' 'ANTHROPIC_AUTH_TOKEN="$token"'; do
-  if grep -qF -- "$needle" "$REPO/scripts/zim-claude"; then
-    fail "the wrapper does not read Token Juice state" "found: $needle"
+SETTINGS="$ZSTATE/claude-settings.json"
+if [[ -f "$SETTINGS" ]]; then
+  pass "the settings file is written"
+  if command -v python3 >/dev/null 2>&1; then
+    rows="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+p = d["modelPicker"]
+print(len(p["options"]))
+print("yes" if p.get("replaceBuiltInOptions") else "no")
+print(" ".join(o["model"] for o in p["options"]))
+' "$SETTINGS" 2>/dev/null || true)"
+    assert_contains "  ...it lists every model" "5" "$(head -1 <<<"$rows")"
+    assert_contains "  ...it replaces the built-in lineup" "yes" "$(sed -n 2p <<<"$rows")"
+    assert_contains "  ...non-Claude ids are included" "deepseek-v4-1-flash-1017" "$rows"
+    assert_contains "  ...and so are Claude ones" "claude-opus-5-5" "$rows"
   else
-    pass "the wrapper does not read Token Juice state ($needle)"
+    skip "python3 not available — cannot parse the settings file"
   fi
-done
+else
+  fail "the settings file is written" "$SETTINGS missing"
+fi
+
+# A user's own --settings wins: two would fight, and theirs is the one that
+# should apply.
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  "$ZC" --settings /tmp/mine.json --version 2>&1 >/dev/null)"
+assert_contains "a user --settings is respected" "your --settings wins" "$err"
+
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  "$ZC" --settings /tmp/mine.json --version 2>/dev/null)"
+assert_contains "  ...and is the only one passed" "[1]=<--settings>" "$out"
+assert_contains "  ...with their path" "[2]=</tmp/mine.json>" "$out"
+
+# ZIM_CLAUDE_NO_PICKER=1 opts out of the settings file entirely.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$SBX/state-nopicker" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  ZIM_CLAUDE_NO_PICKER=1 "$ZC" --version 2>/dev/null)"
+assert_lacks "ZIM_CLAUDE_NO_PICKER=1 adds no --settings" "--settings" "$out"
+
+# ...and it must opt out on a machine that has already run once. The settings
+# file from an earlier run is still on disk, so keying the hand-off off the
+# file's existence would keep passing it and the flag would do nothing.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  ZIM_CLAUDE_NO_PICKER=1 "$ZC" --version 2>/dev/null)"
+assert_lacks "ZIM_CLAUDE_NO_PICKER=1 opts out even with a stale settings file" "--settings" "$out"
+
+# A non-Claude id gets behavesAs, so Claude Code stops assuming a 1M window and
+# stops printing the unrecognized-model warning on every run. A Claude id does
+# not: Claude Code already knows it, and overriding its handling is a downgrade.
+if [[ -f "$SETTINGS" ]] && command -v python3 >/dev/null 2>&1; then
+  rows="$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for o in d["modelPicker"]["options"]:
+    print(o["model"] + "=" + str(o.get("behavesAs", "")))
+' "$SETTINGS" 2>/dev/null || true)"
+  assert_contains "a non-Claude id borrows a known model's handling" \
+    "deepseek-v4-1-flash-1017=claude-sonnet-4-5" "$rows"
+  assert_contains "a Claude id is left alone" "claude-opus-5-5=" "$rows"
+else
+  skip "cannot check behavesAs without the settings file and python3"
+fi
+
+# The window Claude Code plans against comes from the catalog's own
+# context_length, not from a hardcoded number: the stub advertises 128000.
+out="$(run_zc --version)"
+assert_contains "the catalog's context length reaches claude" \
+  "WINDOW=128000" "$out"
 
 section "wrapper: failure modes"
 
 err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_STATUS=401 \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_BAD ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>&1 >/dev/null)"
+  ZIM_CLAUDE_API_KEY=coa_live_BAD ZIM_CLAUDE_MODEL=x "$ZC" --version 2>&1 >/dev/null)"
 assert_eq "a rejected environment key exits 2" "2" "$?"
 assert_contains "a rejected environment key says where to rotate" \
-  "Rotate it at https://tokenharbor.ai/dashboard/api-keys" "$err"
+  "Rotate it at https://coarena.ai/account/api" "$err"
 
 err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_STATUS=000 \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>&1 >/dev/null)"
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=x "$ZC" --version 2>&1 >/dev/null)"
 assert_eq "an unreachable API exits 2" "2" "$?"
-assert_contains "an unreachable API names the host" "could not reach https://tokenharbor.ai" "$err"
+assert_contains "an unreachable API names the host" "could not reach https://coarena.ai/api" "$err"
 
 err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb ZC_MODELS='{"data":[]}' \
   ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version 2>&1 >/dev/null)"
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY "$ZC" --version 2>&1 >/dev/null)"
 assert_eq "an empty catalog exits 2" "2" "$?"
 assert_contains "an empty catalog says so" "returned no model ids" "$err"
 
+# The catalog is public, so a 200 there proves nothing about the key. The
+# probe must be /v1/limits, which is the route that actually 401s.
+err="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZC_LIMITS_STATUS=401 ZC_MODELS_STATUS=200 \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_BAD ZIM_CLAUDE_MODEL=x "$ZC" --version 2>&1 >/dev/null)"
+assert_eq "a bad key is caught even when the catalog answers 200" "2" "$?"
+
 env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN=/nonexistent/claude ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" --version >/dev/null 2>&1
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY "$ZC" --version >/dev/null 2>&1
 assert_eq "missing claude binary exits 2" "2" "$?"
 
 # A non-zero exit from claude must pass through untouched, not become 2.
@@ -984,21 +1083,23 @@ EOF
 chmod +x "$SBX/stub-fail"
 env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
   ZIM_CLAUDE_BIN="$SBX/stub-fail" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
-  ZIM_CLAUDE_API_KEY=thk_live_TESTKEY ZIM_CLAUDE_MODEL=x ZIM_CLAUDE_USE_TOKENHARBOR=1 \
-  "$ZC" >/dev/null 2>&1
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=x "$ZC" >/dev/null 2>&1
 assert_eq "claude's exit code passes through" "42" "$?"
 
 section "stdout hygiene"
 
 out="$(run_zc --version)"
-assert_contains "stub output reaches stdout" "ARGC=1" "$out"
+assert_contains "stub output reaches stdout" "ARGC=3" "$out"
 if [[ "$out" == *"[zim-claude]"* ]]; then
   fail "diagnostics stay off stdout" "found a [zim-claude] line on stdout"
 else pass "diagnostics stay off stdout (clean)"; fi
 
-# Even the outage notice must not pollute stdout, or `-p ... | jq` breaks.
-out="$(notice_zc 2>/dev/null)"
-assert_eq "the notice does not reach stdout" "" "$out"
+# Even the advisory warnings must not pollute stdout, or `-p ... | jq` breaks.
+out="$(env -i HOME="$SBX" PATH="$ZCURL:/usr/bin:/bin" TERM=dumb \
+  ZIM_CLAUDE_BIN="$STUB" ZIM_CLAUDE_STATE_DIR="$ZSTATE" ZIM_CLAUDE_NO_UPDATE=1 \
+  ZIM_CLAUDE_API_KEY=coa_live_TESTKEY ZIM_CLAUDE_MODEL=kimi-k3 \
+  ANTHROPIC_BASE_URL="https://tokenharbor.ai" "$ZC" --version 2>/dev/null)"
+assert_lacks "the inherited-route warning does not reach stdout" "[zim-claude]" "$out"
 
 section "clean install with prerequisites present"
 
