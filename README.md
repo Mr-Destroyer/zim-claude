@@ -2,16 +2,16 @@
 
 <h1>zim-claude</h1>
 
-<p><strong>Claude Code, pointed at Coarena.</strong></p>
+<p><strong>Claude Code, pointed at Numes.</strong></p>
 
 <p>Same flags, same subcommands, same interactive UI as <code>claude</code> —<br>
-it just talks to Coarena instead of Anthropic.</p>
+it just talks to Numes instead of Anthropic.</p>
 
 <p>
 <a href="#install"><img src="https://img.shields.io/badge/platform-Linux%20%C2%B7%20macOS%20%C2%B7%20Windows-2f81f7?style=flat-square" alt="Platform"></a>
-<a href="#coarena"><img src="https://img.shields.io/badge/Coarena-one%20key-2f81f7?style=flat-square" alt="Coarena"></a>
-<a href="#the-litellm-proxy-optional"><img src="https://img.shields.io/badge/proxy-LiteLLM%20(optional)-6f42c1?style=flat-square" alt="Optional LiteLLM proxy"></a>
-<a href="https://coarena.ai/account/api"><img src="https://img.shields.io/badge/Coarena-get%20a%20key-5865F2?style=flat-square" alt="Get a Coarena key"></a>
+<a href="#numes"><img src="https://img.shields.io/badge/Numes-one%20key-2f81f7?style=flat-square" alt="Numes"></a>
+<a href="#numes"><img src="https://img.shields.io/badge/proxy-per--session%20Python-6f42c1?style=flat-square" alt="Per-session translation proxy"></a>
+<a href="https://numes.ai/dashboard/keys"><img src="https://img.shields.io/badge/Numes-get%20a%20key-5865F2?style=flat-square" alt="Get a Numes key"></a>
 </p>
 
 <img src="screenshots/screenshot-1-zim-claude.png" alt="zim-claude running in a terminal" width="620">
@@ -32,130 +32,164 @@ zim-claude mcp list                         # any claude subcommand works
 zim-claude mcp add demo -- npx -y some-mcp  # arguments pass through untouched
 ```
 
-No proxy, no config file, no daemon. Coarena serves the Anthropic Messages API
-natively, so `zim-claude` validates your key against `/v1/limits`, fetches the catalog,
-picks a model, and `exec`s `claude` with `ANTHROPIC_*` set for that process only.
+The one wrinkle is the protocol. **Numes speaks the OpenAI Chat Completions API;
+Claude Code speaks only the Anthropic Messages API.** Numes deliberately has no
+`/v1/messages` route, so pointing `ANTHROPIC_BASE_URL` at Numes gives a 404 on every
+turn. `zim-claude` therefore starts a small local translation proxy for the session,
+points one `claude` process at it, and stops it when the session ends:
 
 ```
-  Claude Code  ──▶  Coarena  ──▶  the model you picked
-   zim-claude      (direct)        (one key, whole catalog)
+  Claude Code  ──Anthropic Messages──▶  zim-claude-numes-proxy  ──Chat Completions──▶  Numes  ──▶  the model you picked
+   zim-claude                           (127.0.0.1, per session)                        (one key)
 ```
 
-## Coarena
+There is no system-wide daemon, no config file and no shell-profile mutation. The
+proxy is a child of the wrapper, listens on loopback only, and is killed when `claude`
+exits. A plain `claude` in another terminal is untouched.
 
-[Coarena](https://coarena.ai) runs a free Model API in front of a frontier lineup —
-Claude, DeepSeek, Gemini, Kimi, Grok, Qwen, GLM, MiniMax and more — behind one key and
-one Anthropic-native endpoint. `zim-claude` points a single `claude` process at it.
+## Numes
 
-**Every model is priced at `0` in and `0` out.** That is not the same as unlimited: the
-account is metered in real dollars against a **daily allowance** (`$5.00/day` by
-default), and `/v1/limits` reports what is left. The model picker prints the remaining
-budget beside the list, so the ceiling is never a surprise:
+[Numes](https://numes.ai) is a marketplace for AI inference: independent providers
+serve the models, and you call all of them through one OpenAI-compatible endpoint with
+one key. Pricing is per token and charged against a prepaid balance in the key's chosen
+currency (USD or BTC).
 
-```
-[zim-claude] models on coarena.ai/api — $4.57 of $5.00 left today
-   1) claude-fable-5             Claude Fable 5
-   ...
-   7) deepseek-v4-1-flash-1017   DeepSeek V4.1 Flash 1017
-   ...
-  select 1-18 [7]:
-```
+Not every model is paid. The catalogue currently lists **six genuinely free,
+tool-capable models** — `$0` input and `$0` output:
 
-### Get a Coarena key
+| Model id | Name | Context |
+|---|---|---|
+| `deepseek/deepseek-v4.1-flash` | DeepSeek V4.1 Flash | 1M |
+| `moonshotai/kimi-k3.1-pro` | Kimi K3.1 Pro | 1M |
+| `nvidia/nemotron-3-ultra-550b-a55b` | Nemotron 3 Ultra | 200k |
+| `dealignai/deepseek-v4.1-flash-uncensored-fp8` | DeepSeek V4.1 Flash Uncensored FP8 | 1M |
+| `dealignai/glm-5.3-flash-uncensored-fp8` | GLM 5.3 Flash Uncensored FP8 | 1M |
+| `dealignai/glm-5.3-uncensored-fp8` | GLM 5.3 Uncensored FP8 | 1M |
 
-1. Create one at [coarena.ai/account/api](https://coarena.ai/account/api).
+The model picker prints each model's price beside its name and lists free models first,
+so the distinction is visible rather than implied. It defaults to the free DeepSeek
+V4.1 Flash. `ZIM_CLAUDE_FREE_ONLY=1` narrows the list to those $0 models.
+
+"Free" here means a `$0` token price, not an unlimited account: paid models draw down
+the key's balance, and the picker prints the remaining budget from `GET /key` above the
+list. If the balance is exhausted, paid models fail with a 402 while free models keep
+working.
+
+### Get a Numes key
+
+1. Create one at [numes.ai/dashboard/keys](https://numes.ai/dashboard/keys). Pick its
+   currency (USD or BTC) — it cannot be changed later.
 2. Either paste it at the first prompt — it is cached at
-   `~/.local/share/zim-claude/coarena.key` (mode 600) — or export
-   `ZIM_CLAUDE_API_KEY=coa_…` and keep it in your shell profile.
-3. Pin a model with `ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017` to skip the picker.
+   `~/.local/share/zim-claude/numes.key` (mode 600) — or export `NUMES_API_KEY=sk-…`
+   and keep it in your shell profile.
+3. Pin a model with `ZIM_CLAUDE_MODEL=deepseek/deepseek-v4.1-flash` to skip the picker.
 
-The key is asked for **once**. After that every run reads the cached copy.
+The key is asked for **once**. After that every run reads the cached copy. A key from
+the environment is never written to disk.
 
 ### What a run actually does
 
-Five steps, in order. Each one exists because of a specific thing Coarena does
+Seven steps, in order. Each one exists because of a specific thing Numes does
 differently from Anthropic, and each is worth knowing when something goes wrong.
 
-**1. The base URL is `https://coarena.ai/api`, not `…/api/v1`.**
+**1. The API root is `https://api.numes.ai/api/v1`.**
 
-This is the single most common way to misconfigure a gateway, so it is worth being
-precise. The Anthropic SDK appends `/v1/messages` to whatever base it is handed. Hand it
-`https://coarena.ai/api` and a turn goes to `/api/v1/messages` — correct. Hand it
-`https://coarena.ai/api/v1` and the same turn goes to `/api/v1/v1/messages`, which
-answers **404 on every single request** while the catalog and the key check both keep
-working. The failure looks like "the model is broken" rather than "the URL is wrong", so
-`zim-claude` composes the base itself and `tests/run-tests.sh` asserts the `/api/v1`
-form never appears.
+Chat lives at `/chat/completions`; key metadata at `/key`; the catalogue at `/models`.
+There is no Anthropic Messages route. That is why the wrapper starts the translation
+proxy rather than exporting the upstream URL directly.
 
-**2. The key is validated against `/v1/limits`, not `/v1/models`.**
+**2. The key is validated against `/key`, not `/models`.**
 
-`/v1/models` is **public** — it answers `200` with no key at all. Probing it would accept
-any string you typed, cache it, and only fail later on the first real turn. `/v1/limits`
-is the endpoint that actually requires the credential: `401` without a key, `200` with
-one. So the wrapper probes `/v1/limits` first, and only then fetches the catalog.
+`/key` is the credential probe: it answers `401` for a bad key and `200` for a good one,
+and it carries the key's limit, remaining balance and usage. The catalogue is a second
+request because it is a different thing — `/key` carries the budget, `/models` carries
+the lineup. (`/credits` exists too, but it requires a *management* key, not an inference
+key.)
 
-**3. The catalog is fetched separately.**
+**3. The catalogue is filtered to models that can drive Claude Code.**
 
-`/v1/limits` carries the budget; `/v1/models` carries the lineup. They are two requests
-because they are two different things, and the picker needs both — the list to choose
-from and the remaining allowance to print above it.
+The wrapper fetches
+`/models?output_modalities=text&supported_parameters=tools&sort=pricing-low-to-high`.
+Claude Code is entirely tool-driven: a model without tool calling can answer prose but
+cannot read files, run commands or edit code. Filtering on `tools` keeps unusable rows
+out of the picker; sorting by price puts the free models at the top. If a key can see no
+tool-capable model, the wrapper retries unfiltered and warns.
 
 **4. A model is chosen, and the choice is remembered.**
 
-The picker defaults to last session's model when the catalog still lists it, so pressing
-Enter repeatedly is stable instead of drifting to whatever sorts first. A fresh install
-starts on `deepseek-v4-1-flash-1017`. `ZIM_CLAUDE_MODEL` skips the picker entirely, which
-is what a script wants.
+The picker shows the model id, display name, price and context length, and defaults to
+last session's model when the catalogue still lists it. A fresh install starts on
+`deepseek/deepseek-v4.1-flash`. `ZIM_CLAUDE_MODEL` skips the picker entirely, which is
+what a script wants.
 
-**5. `claude` is `exec`ed with `ANTHROPIC_*` set for that process only.**
+**5. A session settings file puts every model in `/model`.**
 
-Nothing is written to your shell profile, and nothing is exported globally. A plain
-`claude` in another terminal is untouched.
+Claude Code's built-in `/model` list knows nothing about Numes' ids. The wrapper writes
+a `modelPicker` file and passes it with `--settings`, so `/model` lists **every model in
+the catalogue** under its real name, for that session only.
+
+**6. The local proxy starts on a free loopback port.**
+
+It is
+[`scripts/zim-claude-numes-proxy`](scripts/zim-claude-numes-proxy), a stdlib-only Python
+program. It translates system prompts, user/assistant turns, images, `tool_use` /
+`tool_result` blocks, tool schemas, `tool_choice`, `max_tokens`, sampling parameters and
+streaming SSE. Tool calls are native: Numes supports them, so there is no prompt-emulated
+tool protocol to drift. The wrapper reads the port from a private file, health-checks it,
+and passes `--parent-pid` so the proxy exits if the wrapper is killed.
+
+**7. `claude` runs with `ANTHROPIC_*` scoped to that process, then the proxy stops.**
+
+Nothing is written to your shell profile, and nothing is exported globally. When
+`claude` exits its status is passed through unchanged, the proxy is stopped and the
+port file is removed.
 
 ### Switching models with `/model`
 
 `/model` inside Claude Code lists Claude Code's built-in lineup, which knows nothing
-about Coarena's ids. `zim-claude` fixes that by writing a `modelPicker` settings file and
-passing it with `--settings`, so `/model` lists **every model in the catalog** under its
-real name, for that session only:
+about Numes' ids. `zim-claude` fixes that by writing a `modelPicker` settings file and
+passing it with `--settings`, so `/model` lists every Numes model under its real name:
 
 ```
 /model
-  → Claude Opus 5.5, Claude Sonnet 5.5, DeepSeek V4.1 Flash 1017,
-    Gemini 4 Argon, Kimi K3, Grok 4.7, Qwen3.8-2.4T-A95B, …
+  → DeepSeek V4.1 Flash, Kimi K3.1 Pro, GPT-6 Luna, Claude Opus 5.5,
+    Gemini 4 Argon, Mistral Nemo, …
 ```
 
-Three details worth knowing:
+Four details worth knowing:
 
 * **Nothing is written to `~/.claude/settings.json`.** These models only exist while
-  routed through Coarena, so a plain `claude` in another terminal must not inherit them.
+  routed through Numes, so a plain `claude` in another terminal must not inherit them.
   The file lives at `~/.local/share/zim-claude/claude-settings.json`.
 * **Your own `--settings` wins.** If you pass one, the wrapper steps aside and says so.
 * **`ZIM_CLAUDE_NO_PICKER=1`** turns the whole thing off — including on a machine that
   has already run once and left a settings file behind.
+* **The proxy honours the id.** A `/model` pick containing `/` (every Numes id) is sent
+  upstream as-is. Anthropic tier names Claude Code invents for background calls are
+  mapped to the session's model, because Numes has no such ids.
 
 Claude Code's own gateway discovery (`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) is
 *not* used, deliberately: it keeps only ids containing `claude` or `anthropic`, which
-would hide every non-Claude model in the catalog — 12 of the 18 at the time of writing.
+would hide every non-Claude model — most of the catalogue.
 
 ### The context window, and why it needs two settings
 
 This is the least obvious part of the integration, and getting it wrong is silent until
 a long session dies.
 
-Claude Code ships a catalog of the models it knows. Every Coarena id that is not a
-Claude id — `deepseek-v4-1-flash-1017`, `kimi-k3`, `grok-4-7` and the rest — is **not in
-that catalog**. For an unknown model Claude Code does not refuse to run; it guesses, and
-its guess is a **1M-token window**. Coarena's models are **128k**. That guess is eight
-times too generous, and the consequence is not cosmetic: auto-compact waits for 1M
-tokens of history before it fires, so the request hits Coarena's real 128k limit and
+Claude Code ships a catalog of the models it knows. Every Numes id — including
+`anthropic/claude-opus-5.5`, which is not the id Claude Code knows — is **not in that
+catalog**. For an unknown model Claude Code does not refuse to run; it guesses, and its
+guess is a **1M-token window**. Several Numes models are **128k** or **200k**. That
+guess is too generous, and the consequence is not cosmetic: auto-compact waits for 1M
+tokens of history before it fires, so the request hits the model's real limit and
 **400s on length long before compaction ever runs**. The session dies instead of
 compacting.
 
 On top of that, every run printed a warning:
 
 ```
-Claude Code doesn't recognize the model "deepseek-v4-1-flash-1017", so it assumes a
+Claude Code doesn't recognize the model "deepseek/deepseek-v4.1-flash", so it assumes a
 context window of 1m tokens.
 ```
 
@@ -167,14 +201,15 @@ enough**:
 | `behavesAs` on the `modelPicker` row | the warning, and the client-side handling (prompt profile, capability and effort defaults) | the window — it inherits the borrowed model's 200k |
 | `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | the window Claude Code actually plans against | the warning |
 
-So the wrapper does both. Each non-Claude row gets `"behavesAs": "claude-sonnet-4-5"` —
-a stable id, and the closest match for a general tool-calling model — and
+So the wrapper does both. Every row gets `"behavesAs": "claude-sonnet-4-5"` — a stable
+id, and the closest match for a general tool-calling model — and
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` is set to the **catalog's own `context_length`** for
-the model you picked, not to a number hardcoded in the wrapper. If Coarena changes a
+the model you picked, not to a number hardcoded in the wrapper. If Numes changes a
 model's window, the wrapper follows it on the next run.
 
-Claude ids (`claude-opus-5-5`, `claude-sonnet-5-5`, …) are left alone on both counts:
-Claude Code already knows them, so overriding their handling would be a downgrade.
+Claude Code caps the value it accepts at 1,000,000 and warns above it, so the wrapper
+clamps a larger catalogue figure (some Numes models advertise 1,048,576) to 1M. Only
+the last 48k of those models goes unused, and the session stays quiet.
 
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is *not* the lever here, though it looks like one. It
 silences the prose but leaves the 1M assumption in place and still emits the
@@ -185,28 +220,30 @@ The result is a session that is quiet and correctly bounded:
 ```
 $ zim-claude -p "/context"
 ## Context Usage
-**Model:** deepseek-v4-1-flash-1017
-**Tokens:** 20.5k / 128k (16%)
+**Model:** deepseek/deepseek-v4.1-flash
+**Tokens:** 20.5k / 1M (2%)
 ```
 
 ### The default model
 
-A fresh install starts on **DeepSeek V4.1 Flash 1017** — the fastest tool-capable entry
-in the catalog. It is a speed choice, not a cost one: every model on Coarena is free per
-token. For heavier agentic work, `/model` to `claude-sonnet-5-5` or `claude-opus-5-5`.
+A fresh install starts on **DeepSeek V4.1 Flash** (`deepseek/deepseek-v4.1-flash`) — a
+free, tool-capable 1M-context entry. It is a speed and cost choice: the model is `$0` in
+and `$0` out. For heavier agentic work, `/model` to `anthropic/claude-sonnet-5.5` or
+`anthropic/claude-opus-5.5`, which draw on the account balance.
 
 ### Keys from other providers are refused
 
 A key from a provider this package no longer routes to cannot work, and sending it to
-Coarena would read as "your key is broken". The wrapper names the real reason instead:
+Numes would read as "your key is broken". The wrapper names the real reason instead:
 
 | Situation | What happens |
 |---|---|
-| `ZIM_CLAUDE_API_KEY` holds a `tj_…` key | refused — Token Juice is no longer a route |
-| `ZIM_CLAUDE_API_KEY` holds a `thk_…` key | refused — TokenHarbor is no longer a route |
-| `ZIM_CLAUDE_BASE_URL` names either | refused, with the reason |
+| `ZIM_CLAUDE_API_KEY` holds a `coa_…` key | refused — Coarena is no longer a route |
+| `ZIM_CLAUDE_API_KEY` holds a `tj_…` key | refused — Token Juice is not a route |
+| `ZIM_CLAUDE_API_KEY` holds a `thk_…` key | refused — TokenHarbor is not a route |
+| `ZIM_CLAUDE_BASE_URL` names any of them | refused, with the reason |
 | No key anywhere, terminal available | prompts once, then caches it |
-| No key anywhere, no terminal | exits 2 and names `ZIM_CLAUDE_API_KEY` |
+| No key anywhere, no terminal | exits 2 and names `NUMES_API_KEY` |
 
 The old shared Token Juice key still sits in `config/token`, kept as a marker so nobody
 goes looking for it — but **nothing loads it any more**: not the installer, not the
@@ -215,15 +252,16 @@ wrapper, not the Windows port. `tests/run-tests.sh` fails if a loader comes back
 ### The LiteLLM proxy is optional and unrelated
 
 `install.sh` still installs the LiteLLM proxy and its `~/tokenjuice/` config, because
-other harnesses on the machine may use it. `zim-claude` itself does not touch it: there
-is no proxy in the path, and the wrapper never reads `~/tokenjuice/`.
+other harnesses on the machine may use it. `zim-claude` itself does not touch it: the
+Numes route goes through the bundled Python proxy, and the wrapper never reads
+`~/tokenjuice/`.
 
 ---
 
 ## Install
 
 <table>
-<tr><th align="left">Linux · macOS · WSL</th><th align="left">Windows</th></tr>
+<tr><th align="left">Linux · macOS · WSL</th><th align="right">Windows</th></tr>
 <tr><td>
 
 <pre><code>git clone &lt;this repo&gt; zim-claude
@@ -241,9 +279,10 @@ win-install.bat</code></pre>
 
 That's it. Open a new terminal and run `zim-claude`.
 
-The installer does not ask for a Coarena key — it installs the command, records the
-checkout for auto-update, and leaves `~/tokenjuice/` exactly as it found it. Run
-`zim-claude` and it asks for a key once, then caches it (see [Coarena](#coarena)).
+The installer does not ask for a Numes key — it installs the command and the translation
+proxy, records the checkout for auto-update, and leaves `~/tokenjuice/` exactly as it
+found it. Run `zim-claude` and it asks for a key once, then caches it (see
+[Numes](#numes)).
 
 If you want the optional LiteLLM proxy route for another harness on the machine, pass a
 key in:
@@ -256,9 +295,9 @@ ZIM_CLAUDE_TOKEN=tj_… ./install.sh
 
 | Installer | Platform | What it sets up | Run it with |
 |---|---|---|---|
-| `install.sh` | Linux · macOS · WSL | the `zim-claude` command (Coarena) + the optional CLI proxy | `./install.sh` |
-| `windows\win-install.bat` | Windows | `zim-claude`, plus the optional CLI proxy *and* the `:4002` desktop gateway | `win-install.bat` |
-| `claude-desktop-integration/install.sh` | Linux · macOS | the `:4002` gateway only | `cd claude-desktop-integration && ./install.sh` |
+| `install.sh` | Linux · macOS · WSL | the `zim-claude` command (Numes) + the optional CLI proxy | `./install.sh` |
+| `windows\win-install.bat` | Windows | `zim-claude` (Numes), plus the optional CLI proxy *and* the `:4002` desktop gateway | `win-install.bat` |
+| `claude-desktop-integration/install.sh` | Linux · macOS | the `:4002` gateway only (Token Juice, not Numes) | `cd claude-desktop-integration && ./install.sh` |
 
 You normally only need the first one for your platform. The third exists for people who
 want the Claude Desktop gateway without the CLI side.
@@ -271,15 +310,22 @@ want the Claude Desktop gateway without the CLI side.
 
 ## Requirements
 
-`zim-claude` itself needs `claude`, `bash`, `curl` and `base64`; the optional proxy needs
-`litellm` on top. The installer checks for each and offers to install anything missing.
-**Nothing is installed without you answering `y`.**
+`zim-claude` needs `claude`, `bash`, `curl`, `base64` and **Python 3.8+**. The optional
+LiteLLM proxy needs `litellm` on top. The installer checks for each and offers to install
+anything missing. **Nothing is installed without you answering `y`.**
 
 | Tool | If missing |
 |---|---|
 | `bash`, `curl`, `base64` | required — the installer reports and exits |
+| `python3` 3.8+ | required for the Numes translation proxy — the installer reports the platform's install command |
 | Claude Code (`claude`) | offers `curl -fsSL https://claude.ai/install.sh \| bash` |
 | `litellm` | offers to build a private virtualenv containing it |
+
+**Python is part of the Numes route, not an optional extra.** Claude Code itself does
+not need Python; the translation proxy does. On a machine without Python the CLI cannot
+complete a turn, so the installer treats a missing `python3` as a failed prerequisite
+rather than a note. Windows requires Python 3.10+ (the installer offers
+`winget install Python.Python.3.12`).
 
 **You do not need litellm, pip, or a writable system Python.** If no `litellm` is
 found, the installer creates a virtualenv at `~/.local/share/zim-claude/venv` and
@@ -295,14 +341,16 @@ detects sudo, so running it under sudo would guarantee failure.
 <details>
 <summary><b>If <code>python3</code> has no <code>pip</code> or no <code>venv</code></b></summary>
 
-Neither is needed. `python3 -m venv` bootstraps its own `pip` from `ensurepip`, so a
-Python with no system pip still builds the proxy venv — this is the default on Arch,
-where `python` ships without pip. The old advice here (`python3 -m pip install ...`)
-failed with `No module named pip` and installed nothing; the venv path avoids that
-entirely.
+Neither is needed for the Numes proxy: it is stdlib-only, so the interpreter alone is
+enough. The LiteLLM proxy still needs a venv, and `python3 -m venv` bootstraps its own
+`pip` from `ensurepip`, so a Python with no system pip still builds it — this is the
+default on Arch, where `python` ships without pip. The old advice here
+(`python3 -m pip install ...`) failed with `No module named pip` and installed nothing;
+the venv path avoids that entirely.
 
-`venv` itself is the one thing that must be present. Debian/Ubuntu split it out of the
-interpreter package, and the installer detects that and names the fix:
+`venv` itself is the one thing that must be present for the LiteLLM proxy. Debian/Ubuntu
+split it out of the interpreter package, and the installer detects that and names the
+fix:
 
 | Platform | If `python3 -m venv` is missing |
 |---|---|
@@ -333,14 +381,16 @@ directory to `PATH`.)
 | Path | Purpose |
 |---|---|
 | `~/.local/bin/zim-claude` | the command |
+| `~/.local/bin/zim-claude-numes-proxy` | the per-session Anthropic ↔ OpenAI translation proxy |
 | `~/.local/bin/zim-claude-update.sh` | background self-updater (also runnable by hand) |
-| `~/.local/bin/start-litellm.sh` | proxy manager: `start`/`stop`/`restart`/`status`/`logs` |
-| `~/tokenjuice/source` | the optional proxy's env profile — Token Juice key + base URL + model (mode 600); only written when you pass `ZIM_CLAUDE_TOKEN` |
+| `~/.local/bin/start-litellm.sh` | optional proxy manager: `start`/`stop`/`restart`/`status`/`logs` |
+| `~/tokenjuice/source` | the optional LiteLLM proxy's env profile — Token Juice key + base URL + model (mode 600); only written when you pass `ZIM_CLAUDE_TOKEN` |
 | `~/tokenjuice/litellm-config.yaml` | LiteLLM proxy config: which model name maps to which upstream |
-| `~/.local/share/zim-claude/venv/` | the proxy's private virtualenv (litellm + uvloop) |
-| `~/.local/share/zim-claude/coarena.key` | your Coarena key, cached after the first prompt (mode 600) |
-| `~/.local/share/zim-claude/claude-settings.json` | the `modelPicker` file that puts the whole catalog in `/model` (mode 600) |
+| `~/.local/share/zim-claude/venv/` | the optional proxy's private virtualenv (litellm + uvloop) |
+| `~/.local/share/zim-claude/numes.key` | your Numes key, cached after the first prompt (mode 600) |
+| `~/.local/share/zim-claude/claude-settings.json` | the `modelPicker` file that puts the whole catalogue in `/model` (mode 600) |
 | `~/.local/share/zim-claude/last-model` | the model you picked last time — the picker's default |
+| `~/.local/share/zim-claude/numes-proxy.log` | what the translation proxy said (rotated at 256 KB) |
 | `~/.local/share/zim-claude/update.conf` | which checkout and branch the updater tracks |
 | `~/.local/share/zim-claude/update.log` | what the updater did, last few hundred KB |
 | `~/.local/share/zim-claude/` | install state + backups (mode 700) |
@@ -348,12 +398,12 @@ directory to `PATH`.)
 Anything it would overwrite is backed up first, under
 `~/.local/share/zim-claude/backups/<timestamp>/`.
 
-### Where the configuration lives
+### Where the optional proxy configuration lives
 
-Both the credential and the model names live in one directory outside the repo —
-`~/tokenjuice/`, which other harnesses on the machine share. **`zim-claude` does not read
-any of it**: this is the optional LiteLLM route, kept for the other harnesses and for a
-Token Juice key of your own.
+Both the credential and the model names for the **optional LiteLLM route** live in one
+directory outside the repo — `~/tokenjuice/`, which other harnesses on the machine
+share. **`zim-claude` does not read any of it**: it is kept for the other harnesses and
+for a Token Juice key of your own.
 
 | File | What is in it | Who owns it |
 |---|---|---|
@@ -379,7 +429,7 @@ Nothing in this repo overwrites those three files, `--force` included. `config/`
 ./install.sh --uninstall    remove what the installer created
 ./install.sh --force        overwrite files you have hand-edited (still backs up)
 ./install.sh --no-rc        don't touch ~/.bashrc
-./install.sh --start        start the proxy when done
+./install.sh --start        start the LiteLLM proxy when done
 ./install.sh --no-venv      never build the proxy virtualenv
 ./install.sh --port N       use port N instead of auto-detecting one
 ```
@@ -388,14 +438,14 @@ Re-running `install.sh` is safe and idempotent — it compares file contents and
 anything already up to date, and a venv that already holds litellm is left alone.
 
 Building the venv downloads a few hundred megabytes, so it is **asked about, never
-assumed**. In a non-interactive run (`curl … | bash`, CI) there is no terminal to ask,
-so it is skipped and the installer says so — the CLI half still installs. Re-run
+assumed**. In a non-interactive run (`curl … | bash`, CI) there is no terminal to ask, so
+it is skipped and the installer says so — the CLI half still installs. Re-run
 `./install.sh` from a terminal to build it, or use `--no-venv` to skip the question.
 
 `--uninstall` removes the files it installed, but **only if you haven't edited them**,
 and never touches `~/tokenjuice/` — neither the profile nor the model config. It removes
 the proxy virtualenv too — but only one this installer built; a venv you made yourself
-is left in place.
+is left in place. Your cached Numes key and `/model` settings are yours and stay put.
 
 **The credential never comes from the repo.** `~/tokenjuice/` is shared with other
 harnesses on the machine, so an existing profile and an existing model config are used
@@ -407,8 +457,8 @@ entirely — a missing key is not an error, and nothing is read from `config/tok
 
 It also repairs a profile that points at a port which **rejects its own token**. That
 happens when another LiteLLM — ZimZilla's, a leftover install — already owns the port
-and answers every request with `No connected db.` The token is fine, the port is not,
-so the installer backs the profile up and moves only `ANTHROPIC_BASE_URL`.
+and answers every request with `No connected db.` The token is fine, the port is not, so
+the installer backs the profile up and moves only `ANTHROPIC_BASE_URL`.
 
 ### Which port it picks
 
@@ -417,7 +467,7 @@ The installer probes the local ports and writes the one that works into the prof
 | Found | Result |
 |---|---|
 | The profile's port already accepts the token | keep it |
-| The profile's port is free | keep it — `zim-claude` starts its own proxy there |
+| The profile's port is free | keep it — the optional proxy can start there |
 | The profile's port is held by a proxy that rejects the token | move to a port that accepts it |
 | No proxy accepts the token anywhere | take the first free port |
 
@@ -429,11 +479,11 @@ environment variable set. `LITELLM_PORT` still wins when you set it explicitly.
 
 ### The shell config
 
-An `ANTHROPIC_AUTH_TOKEN` in `~/.bashrc` that points at the local proxy but is not the
-profile's key is a dead provider for plain `claude`. The installer backs the file up and
-rewrites those four `ANTHROPIC_*` lines to the profile's key, the auto-detected port, and
-the model named in `~/tokenjuice/litellm-config.yaml`. Everything else in the file — your
-aliases, your own exports, the `PATH` block — is untouched.
+An `ANTHROPIC_AUTH_TOKEN` in `~/.bashrc` that points at the local LiteLLM proxy but is
+not the profile's key is a dead provider for plain `claude`. The installer backs the file
+up and rewrites those four `ANTHROPIC_*` lines to the profile's key, the auto-detected
+port, and the model named in `~/tokenjuice/litellm-config.yaml`. Everything else in the
+file — your aliases, your own exports, the `PATH` block — is untouched.
 
 A profile aimed at another provider is reported, never changed. `--no-rc` skips this
 migration along with the `PATH` block.
@@ -483,16 +533,17 @@ updated, already current, dirty, diverged, fetch failed — is a line there.
 Windows gets its own installer under `windows/`. It is **native** — no WSL, no Git Bash,
 no Node, and no Administrator rights.
 
-`zim-claude` itself routes straight to Coarena here too — the proxies below are the
-optional LiteLLM route, and one installer sets up **both** of them because on Windows
-they are usually wanted together:
+`zim-claude` routes to Numes here too. The same Python translation proxy is installed
+beside the wrapper (`zim-claude-numes-proxy.py`), so **Python 3.10+ is required** for the
+CLI. The optional LiteLLM proxies below are separate; one installer sets up **both** of
+them because on Windows they are usually wanted together:
 
-| | CLI | Claude Desktop |
+| | CLI (Numes) | Optional LiteLLM proxies |
 |---|---|---|
-| Port | auto-detected (default `4000`) | `4002` |
-| Config | `%USERPROFILE%\tokenjuice\litellm-config.yaml` | `%USERPROFILE%\tokenjuice\litellm-config.desktop.yaml` |
-| Credential | `%USERPROFILE%\tokenjuice\source` | the same file |
-| Log | `%USERPROFILE%\.local\share\zim-claude\logs\cli.log` | `...\logs\desktop.log` |
+| Route | `claude` → local Python proxy → `api.numes.ai` | `:4000` CLI, `:4002` Claude Desktop |
+| Config | `%USERPROFILE%\.local\share\zim-claude\` | `%USERPROFILE%\tokenjuice\litellm-config*.yaml` |
+| Credential | `%USERPROFILE%\.local\share\zim-claude\numes.key` | `%USERPROFILE%\tokenjuice\source` |
+| Log | `...\numes-proxy.log` | `...\logs\cli.log`, `...\logs\desktop.log` |
 
 It installs the same `zim-claude` command you get on Linux, into
 `%USERPROFILE%\.local\bin`:
@@ -511,11 +562,11 @@ forwarded to `claude.exe` untouched, and its exit code passes through — so
 ### Windows flags
 
 ```
-win-install.bat                 install both sides, start the proxies
+win-install.bat                 install both sides, start the optional proxies
 win-install.bat -DryRun         print every action, change nothing
-win-install.bat -SkipDesktop    CLI proxy only
+win-install.bat -SkipDesktop    CLI only
 win-install.bat -SkipCli        Claude Desktop gateway (:4002) only
-win-install.bat -NoStart        install but don't start the proxies
+win-install.bat -NoStart        install but don't start the optional proxies
 win-install.bat -Force          overwrite hand-edited files (backed up first)
 win-install.bat -Port N         use port N instead of auto-detecting one
 win-install.bat -Uninstall      remove what the installer created
@@ -527,7 +578,7 @@ Same guarantees as the Linux installer: it backs up anything it would overwrite,
 compares contents so a re-run is a no-op, and **never overwrites your env profile** —
 that file holds a live credential, so `-Force` does not apply to it.
 
-### Manage the proxies
+### Manage the optional proxies
 
 `start-proxies` drives both:
 
@@ -547,8 +598,8 @@ execution policy blocks it anyway). `start-proxies.cmd` is what makes the plain
 command work: it passes `-ExecutionPolicy Bypass` for that one invocation, so your
 machine's policy is untouched. Every `.ps1` here has such a shim for the same reason.
 
-You normally never need these: on Windows too, `zim-claude` itself talks to Coarena
-and never starts or health-checks these proxies. They are the optional LiteLLM route.
+You normally never need these: on Windows too, `zim-claude` itself talks to Numes and
+never starts or health-checks these proxies. They are the optional LiteLLM route.
 
 Windows gets the same auto-update as Linux: `zim-claude` starts
 `zim-claude-update.ps1` in a hidden background process and hands off immediately. It
@@ -561,8 +612,8 @@ to disable it.
 
 | Tool | If missing |
 |---|---|
-| Python 3.10+ | offers `winget install Python.Python.3.12` (litellm is a Python package) |
-| `litellm` | offers `python -m pip install --user "litellm[proxy]"` |
+| Python 3.10+ | required for the Numes translation proxy; offers `winget install Python.Python.3.12` |
+| `litellm` | offers `python -m pip install --user "litellm[proxy]"` (optional route only) |
 | Claude Code | offers Anthropic's native installer, `irm https://claude.ai/install.ps1 \| iex` |
 
 Claude Code on Windows needs **no** WSL, Node, or Administrator rights. It installs to
@@ -575,12 +626,14 @@ is optional — Claude Code only needs it for its Bash tool.
 
 ## Claude Desktop — the `zim` gateway
 
-The **zim gateway** provides **free, unlimited Claude Opus 5.5** to Claude Desktop — the
-new front-tier Anthropic model, with no per-message limits.
+> **This is the optional Token Juice route, not the Numes CLI route.** It is separate
+> from `zim-claude`: its own port, config, log and PID file. The CLI proxy below steers
+> **Claude Code**; Claude Desktop is a different app and ignores those environment
+> variables.
 
-The CLI proxy above steers **Claude Code**. Claude Desktop is a different app, and it
-ignores those environment variables: when it spawns its embedded agent it *blanks* them
-and injects its own credentials. It only accepts a custom endpoint through
+The **zim gateway** provides a free Claude Opus tier to Claude Desktop through LiteLLM.
+When it spawns its embedded agent Claude Desktop *blanks* the `ANTHROPIC_*` variables and
+injects its own credentials. It only accepts a custom endpoint through
 **Third-Party Inference → Gateway**.
 
 So there is a second, independent proxy on `:4002` for it. Separate port, config, log and
@@ -591,8 +644,8 @@ PID file — the CLI proxy keeps working untouched.
 <table>
 <tr>
 <td align="center" valign="top" width="50%">
-<img src="screenshots/screenshot-1-claude-desktop.png" alt="Claude Desktop showing Opus 5.5 Max and zim · Gateway" width="440"><br>
-<sub>The model picker reads <strong>Opus 5.5 Max</strong>; the status bar reads <strong><code>zim · Gateway</code></strong>.</sub>
+<img src="screenshots/screenshot-1-claude-desktop.png" alt="Claude Desktop showing a gateway model" width="440"><br>
+<sub>The model picker reads a Claude-shaped name; the status bar reads <code>zim · Gateway</code>.</sub>
 </td>
 <td align="center" valign="top" width="50%">
 <img src="screenshots/screenshot-2-claude-desktop.png" alt="A Cowork session with the Progress panel open" width="440"><br>
@@ -604,7 +657,7 @@ PID file — the CLI proxy keeps working untouched.
 <img src="screenshots/screenshot-3-claude-desktop.png" alt="The session reporting the model name the gateway exposes" width="600">
 
 <p><em>Asked which model it is, the session answers with the name the gateway exposes it
-under — <code>claude-opus-5-5</code>.</em></p>
+under.</em></p>
 
 </div>
 
@@ -687,9 +740,10 @@ Windows, use the in-app dialog above.
 
 ## The LiteLLM proxy (optional)
 
-This is **not** what `zim-claude` uses — the wrapper talks to Coarena directly. The proxy
-is here for other harnesses on the machine, and for anyone running a Token Juice key of
-their own; `install.sh --start` starts it, and `start-litellm.sh` manages it:
+This is **not** what `zim-claude` uses — the Numes route goes through the bundled Python
+proxy. The LiteLLM proxy is here for other harnesses on the machine, and for anyone
+running a Token Juice key of their own; `install.sh --start` starts it, and
+`start-litellm.sh` manages it:
 
 ```bash
 start-litellm.sh status     # is it running?
@@ -719,24 +773,35 @@ through environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ZIM_CLAUDE_API_KEY` | (unset) | your Coarena key; skips the prompt and is never cached (`COARENA_API_KEY` works too) |
-| `ZIM_CLAUDE_MODEL` | `deepseek-v4-1-flash-1017` | pin a model id to skip the picker |
-| `ZIM_CLAUDE_BASE_URL` | `https://coarena.ai/api` | the API host; naming an old provider is refused |
+| `ZIM_CLAUDE_API_KEY` | (unset) | your Numes key; skips the prompt and is never cached (`NUMES_API_KEY` works too) |
+| `ZIM_CLAUDE_MODEL` | `deepseek/deepseek-v4.1-flash` | pin a model id to skip the picker |
+| `ZIM_CLAUDE_BASE_URL` | `https://api.numes.ai/api/v1` | the API root; naming an old provider is refused |
 | `ZIM_CLAUDE_BIN` | `claude` on `PATH` | which claude to run |
 | `ZIM_CLAUDE_STATE_DIR` | `~/.local/share/zim-claude` | cached key, last pick and the settings file |
 | `ZIM_CLAUDE_NO_PICKER` | `0` | set to `1` to leave `/model` alone (and stop passing `--settings`) |
 | `ZIM_CLAUDE_NO_UPDATE` | `0` | set to `1` to never auto-update |
+| `ZIM_CLAUDE_FREE_ONLY` | `0` | set to `1` to offer only `$0` input/output models |
+| `ZIM_CLAUDE_PROXY_URL` | (unset) | use an existing translation proxy at this URL instead of starting the bundled one |
+| `ZIM_CLAUDE_PROXY_BIN` | beside the wrapper | the translation proxy to run |
+| `ZIM_CLAUDE_PYTHON` | `python3`/`python` | the interpreter for the proxy |
 
 `zim-claude` also sets two variables for the `claude` process it starts, both derived
 from the catalog rather than hardcoded: `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (the model's
-real `context_length`) and, inside the settings file, `behavesAs` on each non-Claude
-row. See [the context window](#the-context-window-and-why-it-needs-two-settings).
+real `context_length`, clamped to Claude Code's 1M ceiling) and, inside the settings
+file, `behavesAs` on each row. See
+[the context window](#the-context-window-and-why-it-needs-two-settings).
 
 Scripted use — no prompts at all:
 
 ```bash
-ZIM_CLAUDE_API_KEY=coa_… ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
+NUMES_API_KEY=sk-… ZIM_CLAUDE_MODEL=deepseek/deepseek-v4.1-flash \
   zim-claude -p "explain this function"
+```
+
+With `ZIM_CLAUDE_FREE_ONLY=1`:
+
+```bash
+NUMES_API_KEY=sk-… ZIM_CLAUDE_FREE_ONLY=1 zim-claude
 ```
 
 <details>
@@ -762,27 +827,53 @@ ZIM_CLAUDE_API_KEY=coa_… ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017 \
 
 ## Troubleshooting
 
-**It asks for a Coarena API key.**
+**It asks for a Numes API key.**
 That is the first-run prompt. Paste a key from
-[coarena.ai/account/api](https://coarena.ai/account/api) and it is cached at
-`~/.local/share/zim-claude/coarena.key` (mode 600) — you are not asked again.
+[numes.ai/dashboard/keys](https://numes.ai/dashboard/keys) and it is cached at
+`~/.local/share/zim-claude/numes.key` (mode 600) — you are not asked again.
 
 **It exits 2 saying there is no terminal to ask on.**
 Prompts need a TTY. In a script, CI or a piped install, say what you want up front:
-`ZIM_CLAUDE_API_KEY=coa_… ZIM_CLAUDE_MODEL=deepseek-v4-1-flash-1017`.
+`NUMES_API_KEY=sk-… ZIM_CLAUDE_MODEL=deepseek/deepseek-v4.1-flash`.
 
-**`that is a Token Juice key (tj_…)` / `that is a TokenHarbor key (thk_…)`.**
+**`python3 is required for the Numes translation proxy.`**
+Numes is OpenAI-compatible; Claude Code is Anthropic-only. The translation layer is
+Python. Install Python 3.8+ (`sudo apt install python3`, `sudo pacman -S python`,
+`sudo dnf install python3`), or set `ZIM_CLAUDE_PYTHON`.
+
+**`that is a Coarena key (coa_…)` / `that is a Token Juice key (tj_…)`.**
 `ZIM_CLAUDE_API_KEY` (or the cached key) holds a key from a provider this package no
-longer routes to. It cannot work on Coarena, so it is refused rather than sent and
-reported as a bad key. Create a Coarena key instead.
+longer routes to. It cannot work on Numes, so it is refused rather than sent and
+reported as a bad key. Create a Numes key instead.
 
-**`/model` does not list the Coarena models.**
+**`Numes rejected ZIM_CLAUDE_API_KEY (HTTP 401)` / `Rotate it at …`.**
+The key is wrong, revoked, or belongs to a different Numes deployment. Create a new one
+at [numes.ai/dashboard/keys](https://numes.ai/dashboard/keys).
+
+**`Numes cannot fund this request: the account is on a funding hold.`**
+A 402 from Numes. Add credits at [numes.ai/dashboard/billing](https://numes.ai/dashboard/billing),
+or choose a free model (`ZIM_CLAUDE_FREE_ONLY=1`).
+
+**`no Numes endpoint could serve this model with the requested features.`**
+A 503. The model may be unavailable, or the endpoint may not support tool calling. Pick
+another tool-capable model from the picker; the catalogue moves.
+
+**The translation proxy did not start.**
+The wrapper prints the tail of `~/.local/share/zim-claude/numes-proxy.log`. The usual
+causes are a missing/too-old Python, a missing proxy file after an upgrade (re-run
+`./install.sh`), or a port problem. Run the proxy by hand to see its stderr:
+
+```bash
+python3 ~/.local/bin/zim-claude-numes-proxy --port 0 --upstream https://api.numes.ai/api/v1
+```
+
+**`/model` does not list the Numes models.**
 Either you passed your own `--settings` (the wrapper steps aside and says so), or
-`ZIM_CLAUDE_NO_PICKER=1` is set. Check `~/.local/share/zim-claude/claude-settings.json`
-exists and is valid JSON.
+`ZIM_CLAUDE_NO_PICKER=1` is set. Check
+`~/.local/share/zim-claude/claude-settings.json` exists and is valid JSON.
 
 **It prints `Claude Code doesn't recognize the model "…"`.**
-That warning means the `behavesAs` row did not reach Claude Code — usually because you
+That warning means a `behavesAs` row did not reach Claude Code — usually because you
 passed your own `--settings`, which replaces the wrapper's file wholesale. The session
 still works, but Claude Code is assuming a 1M-token window instead of the model's real
 one, so a long session will 400 on length before auto-compact fires. Either drop your
@@ -794,11 +885,11 @@ Same cause: the window Claude Code planned against was too large. Check that
 is using) and that the catalog still advertises a `context_length` for the model.
 
 **It warns `ignoring inherited ANTHROPIC_BASE_URL=...`.**
-Your shell exports an `ANTHROPIC_BASE_URL` — often the old `~/tokenjuice/source` profile
-or a `localhost:4000` proxy. `zim-claude` replaces it for its own process only, so plain
+Your shell exports an `ANTHROPIC_BASE_URL` — often the old `~/tokenjuice/source` profile,
+a LiteLLM proxy, or Coarena. `zim-claude` replaces it for its own process only, so plain
 `claude` is unaffected. The warning is informational; drop the export to silence it.
 
-**The proxy won't start.**
+**The optional LiteLLM proxy won't start.**
 
 ```bash
 start-litellm.sh logs
@@ -849,7 +940,7 @@ enforces.
 
 **Desktop picker is empty / model missing.**
 Confirm `verify.sh` shows a `claude*` id from `/v1/models`. A non-claude name is silently
-dropped by the app.
+dropped by the app. This is the Token Juice gateway, not the Numes CLI.
 
 **Desktop requests fail with 400.**
 The upstream rejected Anthropic-only fields — ensure `drop_params: true` is on the model
@@ -865,29 +956,46 @@ odd message.
 
 ## Notes for maintainers
 
-**`ANTHROPIC_API_KEY=""` in the profile is load-bearing.** Claude Code prefers
+**The translation proxy is load-bearing, not a convenience.** Numes has no
+`/v1/messages` route (it answers 404), so there is no direct `ANTHROPIC_BASE_URL` that
+works. `scripts/zim-claude-numes-proxy` must translate messages, tools, tool results,
+streaming SSE, errors and usage. The unit/integration tests in
+`tests/test-numes-proxy.py` cover each direction; run them directly with
+`python3 tests/test-numes-proxy.py`.
+
+**Tool calls are native.** Numes supports `tools` and emits `tool_calls`, so the proxy
+must not fall back to prompt-emulated tool markup. Claude Code is entirely tool-driven;
+a model that cannot call tools cannot drive it. The catalogue query filters on
+`supported_parameters=tools` for exactly that reason.
+
+**Prices are decimal strings, per token.** The picker multiplies by 1,000,000 for
+display. Do not convert them to floating point and back when displaying the free/paid
+distinction: `0` in both fields is the only definition of "free", and rounding a tiny
+paid price to `$0.00` would lie.
+
+**`ANTHROPIC_API_KEY=""` is load-bearing.** Claude Code prefers
 `ANTHROPIC_AUTH_TOKEN` (sent as `Authorization: Bearer`) and falls back to
 `ANTHROPIC_API_KEY` (`x-api-key`). The fallback check is a truthiness test, so an empty
 string means the auth token wins — and it also clears any real `ANTHROPIC_API_KEY`
 inherited from the shell. Deleting that line breaks authentication.
 
-**The two pins in the proxy venv are floors, not preferences.** `install.sh` installs
+**The two pins in the LiteLLM venv are floors, not preferences.** `install.sh` installs
 `litellm[proxy]>=1.100.1` and `uvloop>=0.22.1`, and lowering either produces a failure
 that still *looks* healthy, which is why `tests/run-tests.sh` asserts them by name:
 
 - **`litellm>=1.100.1`** — older litellm only served Anthropic `/v1/messages` when the
-  model's provider was `anthropic`. This proxy registers its models as `openai/*`, so the
-  one route Claude Code actually uses returned **500** while `/v1/chat/completions` kept
-  working — the proxy looked fine and every request failed.
+  model's provider was `anthropic`. The optional proxy registers its models as
+  `openai/*`, so the one route Claude Code used returned **500** while
+  `/v1/chat/completions` kept working — the proxy looked fine and every request failed.
+  (The Numes proxy is separate and does not use litellm.)
 - **`uvloop>=0.22.1`** — litellm hardcodes uvicorn's event loop to uvloop on Linux
   (`litellm/proxy/proxy_cli.py`; no flag or env var overrides it). uvloop below 0.22
   imports `BaseDefaultEventLoopPolicy`, which **Python 3.14 removed**, so the proxy dies
   at startup and never binds its port.
 
-**The proxy venv is separate from anything else on purpose.** `litellm[proxy]` requires
+**The LiteLLM venv is separate from anything else on purpose.** `litellm[proxy]` requires
 `rich<14.0`, while `textual` 8.x requires `rich>=14.2` — an environment holding both
-cannot resolve at all. zim-claude has no `textual`, but if the app side ever grows
-dependencies, keep them out of this venv rather than merging the two.
+cannot resolve at all. Keep the Numes proxy stdlib-only so it never joins that venv.
 
 **A venv is built on the target machine, never shipped.** `pyvenv.cfg`, the `bin/python`
 symlink and every console-script shebang bake in absolute paths and one exact base
@@ -911,11 +1019,17 @@ unlimited quota ended and the key was revoked, so it authenticates nowhere; noth
 it any more either — `install.sh`, both wrappers and the Windows port all skip it, and
 `tests/run-tests.sh` fails if a loader comes back. It stays in the tree as a marker (and
 because deleting it would only hide the history); new keys are handed out through the
-[Discord](https://discord.gg/7dDwHj6fxf), not by editing this repo. A scripted install can still supply a Token Juice key through
-`ZIM_CLAUDE_TOKEN` for the optional proxy route, and an existing profile is never
-overwritten. The same test allows only that one shipped key and fails the suite if any
-other `tj_…`/`lfu_…`/`thk_…` key appears in a tracked file, so an accidental paste is
-caught before it is committed rather than after it is pushed.
+[Discord](https://discord.gg/7dDwHj6fxf), not by editing this repo. A scripted install
+can still supply a Token Juice key through `ZIM_CLAUDE_TOKEN` for the optional proxy
+route, and an existing profile is never overwritten. The same test allows only that one
+shipped key and fails the suite if any other `tj_…`/`lfu_…`/`thk_…` key appears in a
+tracked file, so an accidental paste is caught before it is committed rather than after
+it is pushed.
+
+**The Numes key is not shipped and must never be.** It is cached at
+`~/.local/share/zim-claude/numes.key` (mode 600) and only read from there or from
+`NUMES_API_KEY` / `ZIM_CLAUDE_API_KEY`. The repository's tests run against a stub key and
+a fake upstream.
 
 **Line endings are pinned in `.gitattributes`.** Git for Windows defaults to
 `core.autocrlf=true`, which would rewrite the bash scripts on checkout and make their
@@ -935,9 +1049,11 @@ one is caught by `tests/run-tests.sh`.
 
 ```bash
 ./tests/run-tests.sh
+python3 tests/test-numes-proxy.py   # proxy only, faster
 ```
 
 Runs everything against a throwaway sandbox `$HOME`; your real config is never touched.
 Covers the installer round-trip, idempotency, secret preservation, the argument
-pass-through matrix (spaces, `--`, empty args, newlines), environment handling, and
-fail-closed behaviour.
+pass-through matrix (spaces, `--`, empty args, newlines), environment handling, the model
+picker, `/model` settings, fail-closed behaviour, auto-update, and the Anthropic ↔ Numes
+translation layer (unit and live-loopback integration).

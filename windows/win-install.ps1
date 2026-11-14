@@ -319,7 +319,7 @@ function Install-EnvProfile {
   # a scripted install. Nothing is read from this checkout any more: Token
   # Juice's unlimited quota ended, so the key file that ships in it is
   # deliberately not loaded, and a missing key is NOT an error - the wrapper
-  # routes to Coarena and asks for its own key on first run. Trims surrounding
+  # routes to Numes and asks for its own key on first run. Trims surrounding
   # whitespace, including the CR a
   # browser copy-paste adds - a trailing CR inside the export produces a 401
   # that looks like a bad key.
@@ -378,7 +378,7 @@ function Install-EnvProfile {
 
   if ([string]::IsNullOrEmpty($token)) {
     # No credential anywhere. Not an error any more: the proxy is optional and
-    # the wrapper asks for its own Coarena key on first run. Anyone who wants
+    # the wrapper asks for its own Numes key on first run. Anyone who wants
     # the proxy route can set ZIM_CLAUDE_TOKEN=tj_... and re-run. Returning
     # success matters - the background updater runs this with no console.
     if ($DryRun) {
@@ -386,7 +386,7 @@ function Install-EnvProfile {
       return $true
     }
     Write-Say "no Token Juice key in $EnvFile or ZIM_CLAUDE_TOKEN - skipping the profile"
-    Write-Say "  (the proxy profile is optional; zim-claude itself routes to Coarena)"
+    Write-Say "  (the proxy profile is optional; zim-claude itself routes to Numes)"
     return $true
   }
 
@@ -544,13 +544,14 @@ function Get-LiteLLMBin {
 }
 
 function Test-Prereqs {
-  # Python is needed for litellm. Checked first because everything else depends
-  # on it and the fix is a single winget command.
+  # Python is needed for BOTH the Numes translation proxy (mandatory for the
+  # CLI) and the optional litellm proxy. Checked first because everything else
+  # depends on it and the fix is a single winget command.
   $python = Get-PythonCmd
   if ($python) {
     Write-Say "found python: $python"
   } else {
-    Write-Warn "python 3.10+ not found (litellm is a Python package)."
+    Write-Warn "python 3.10+ not found (required for the Numes translation proxy)."
     if ((Get-Command winget -ErrorAction SilentlyContinue) -and
         (Confirm-Install 'Python' 'winget install Python.Python.3.12')) {
       Write-Say "running: winget install Python.Python.3.12"
@@ -810,6 +811,10 @@ if (-not $SkipCli) {
   Write-Say "installing the CLI side (port auto-detected)"
   Install-File -Src (Join-Path $WinDir 'zim-claude.cmd')    -Dest (Join-Path $BinDir 'zim-claude.cmd')    -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude.ps1')    -Dest (Join-Path $BinDir 'zim-claude.ps1')    -Scope 'cli' | Out-Null
+  # Numes speaks OpenAI Chat Completions; Claude Code speaks Anthropic
+  # Messages. This stdlib-only Python proxy is the translation layer, installed
+  # beside the wrapper so it is found without a PATH lookup.
+  Install-File -Src (Join-Path $SrcDir 'scripts\zim-claude-numes-proxy') -Dest (Join-Path $BinDir 'zim-claude-numes-proxy.py') -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude-update.ps1') -Dest (Join-Path $BinDir 'zim-claude-update.ps1') -Scope 'cli' | Out-Null
   Install-File -Src (Join-Path $WinDir 'zim-claude-update.cmd') -Dest (Join-Path $BinDir 'zim-claude-update.cmd') -Scope 'cli' | Out-Null
   # The model-name config lives in %USERPROFILE%\tokenjuice and is shared, so it
@@ -849,10 +854,12 @@ if ($script:PrereqFailed) {
 Write-Ok "done. Try:  zim-claude --version"
 
 Write-Host ''
-Write-Say "zim-claude routes to Coarena (https://coarena.ai)."
-Write-Say "  Run zim-claude and it will ask for a Coarena API key once, then save it"
-Write-Say "  to $StateDir\coarena.key (mode 600). Create one at"
-Write-Say "  https://coarena.ai/account/api."
+Write-Say "zim-claude routes to Numes (https://api.numes.ai)."
+Write-Say "  Run zim-claude and it will ask for a Numes API key once, then save it"
+Write-Say "  to $StateDir\numes.key (mode 600). Create one at"
+Write-Say "  https://numes.ai/dashboard/keys."
+Write-Say "  A local Python proxy translates Anthropic Messages to Numes'"
+Write-Say "  OpenAI-compatible API. It starts per session and listens on loopback."
 Write-Say "  The LiteLLM proxy above is optional and unrelated: it stays installed for"
 Write-Say "  other harnesses on this machine."
 

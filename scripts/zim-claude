@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# zim-claude — run Claude Code against Coarena.
+# zim-claude - run Claude Code against Numes.
 #
-# Coarena (https://coarena.ai) runs a free Model API in front of a frontier
-# lineup, and it speaks the Anthropic Messages protocol natively at
-# /api/v1/messages — so Claude Code talks to it directly and no proxy is
-# involved. This wrapper points a single `claude` process at it.
+# Numes (https://numes.ai) is an OpenAI-compatible inference marketplace. Claude
+# Code speaks only the Anthropic Messages API, so this wrapper starts a small
+# local translation proxy (zim-claude-numes-proxy), points one `claude` process
+# at it, and tears it down when the session ends. No daemon is installed
+# system-wide and nothing is written to your shell profile.
 #
 # Every argument is forwarded verbatim to `claude`. This script deliberately
 # parses NO options of its own: `zim-claude --help`, `zim-claude mcp list`,
@@ -15,27 +16,32 @@
 #
 # What a run does:
 #
-#   1. takes a Coarena key from the environment, the state dir, or a prompt
-#   2. validates it against GET /v1/limits (401 without a key, 200 with one)
-#   3. fetches the public catalog from GET /v1/models
-#   4. lets the user pick a model, defaulting to DeepSeek V4.1 Flash
-#   5. writes a session settings file so `/model` lists every Coarena model
-#   6. exports ANTHROPIC_* for this process only, then execs claude
+#   1. takes a Numes key from the environment, the state dir, or a prompt
+#   2. validates it against GET /key (and reads the remaining budget)
+#   3. fetches the tool-capable catalog from GET /models
+#   4. lets the user pick a model, showing each model's price (free first)
+#   5. writes a session settings file so `/model` lists every Numes model
+#   6. starts the local translation proxy on a free loopback port
+#   7. exports ANTHROPIC_* for this process only, runs claude, stops the proxy
 #
 #   ZIM_CLAUDE_API_KEY            key to use; skips the prompt and the cache
-#                                 (COARENA_API_KEY is accepted too)
+#                                 (NUMES_API_KEY is accepted too)
 #   ZIM_CLAUDE_MODEL              model id to use; skips the picker
-#   ZIM_CLAUDE_BASE_URL           API base URL  (default https://coarena.ai/api)
+#   ZIM_CLAUDE_BASE_URL           API root (default https://api.numes.ai/api/v1)
 #   ZIM_CLAUDE_BIN                claude binary (default: `claude` on PATH)
 #   ZIM_CLAUDE_STATE_DIR          key cache, last pick and the settings file
 #   ZIM_CLAUDE_NO_UPDATE=1        never auto-update
-#   ZIM_CLAUDE_NO_PICKER=1        do not add Coarena models to `/model`
+#   ZIM_CLAUDE_NO_PICKER=1        do not add Numes models to `/model`
+#   ZIM_CLAUDE_FREE_ONLY=1        only offer models priced $0 in and $0 out
+#   ZIM_CLAUDE_PROXY_URL          use an existing translation proxy instead of
+#                                 starting the bundled one
+#   ZIM_CLAUDE_PYTHON             python3 interpreter for the proxy
 
 set -euo pipefail
 
-# Self-locating, so a symlinked or relocated install still finds its sibling
-# updater. Resolved without `readlink -f`: that flag is GNU-only and this
-# package claims macOS support.
+# Self-locating, so a symlinked or relocated install still finds its siblings.
+# Resolved without `readlink -f`: that flag is GNU-only and this package claims
+# macOS support.
 _zc_src="${BASH_SOURCE[0]}"
 while [[ -L "$_zc_src" ]]; do
   _zc_dir="$(cd -P -- "$(dirname -- "$_zc_src")" && pwd)"
@@ -44,24 +50,31 @@ while [[ -L "$_zc_src" ]]; do
 done
 _self_dir="$(cd -P -- "$(dirname -- "$_zc_src")" && pwd)"
 
-# The Messages root, NOT /api/v1. The Anthropic SDK appends /v1/messages to
-# whatever base it is handed, so this composes to /api/v1/messages. Handing it
-# /api/v1 would compose to /api/v1/v1/messages and 404 on every turn while the
-# catalog still worked — the provider's own docs name this exact base.
-BASE_URL="${ZIM_CLAUDE_BASE_URL:-https://coarena.ai/api}"
+# The API root. Numes appends /chat/completions for inference and serves
+# /key and /models beside it; the catalog is at /models, not /models/v1.
+BASE_URL="${ZIM_CLAUDE_BASE_URL:-https://api.numes.ai/api/v1}"
 BASE_URL="${BASE_URL%/}"
 STATE_DIR="${ZIM_CLAUDE_STATE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/zim-claude}"
 LAST_MODEL_FILE="$STATE_DIR/last-model"
-KEY_FILE="$STATE_DIR/coarena.key"
+KEY_FILE="$STATE_DIR/numes.key"
 SETTINGS_FILE="$STATE_DIR/claude-settings.json"
 
-# The model a fresh install starts on. DeepSeek V4.1 Flash is the fastest
-# tool-capable entry in the catalog and the one this package defaults to.
-# Every model on Coarena is priced at 0 in and 0 out, so this is a speed
-# choice, not a cost one — see the budget line the picker prints.
-DEFAULT_MODEL="deepseek-v4-1-flash-1017"
+# The model a fresh install starts on: free, tool-capable, 1M context. Every
+# price on Numes is per token; a free model is genuinely $0 in and $0 out, but
+# a paid model still draws down the account balance, so the picker prints the
+# price instead of calling the whole catalogue "free".
+DEFAULT_MODEL="deepseek/deepseek-v4.1-flash"
 
 CLAUDE_BIN="${ZIM_CLAUDE_BIN:-$(command -v claude 2>/dev/null || true)}"
+
+# The translation proxy is a Python program. Claude Code itself does not need
+# Python, but this route does: without it there is no Messages endpoint.
+PYTHON="${ZIM_CLAUDE_PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+  PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+fi
+
+PROXY_BIN="${ZIM_CLAUDE_PROXY_BIN:-$_self_dir/zim-claude-numes-proxy}"
 
 # All diagnostics go to stderr: `zim-claude -p "x" --output-format json | jq`
 # must stay parseable, and the model menu must not pollute stdout either.
@@ -74,13 +87,20 @@ info() { printf '\033[36m[zim-claude]\033[0m %s\n' "$*" >&2; }
 [[ -n "$CLAUDE_BIN" ]] \
   || die "claude not found on PATH. Install Claude Code, or set ZIM_CLAUDE_BIN."
 
-# Check it is actually runnable: exec'ing a missing file would surface as a
+# Check it is actually runnable: running a missing file would surface as a
 # bare 127 with no explanation.
 [[ -x "$CLAUDE_BIN" ]] \
   || die "claude is not executable: $CLAUDE_BIN"
 
 command -v curl >/dev/null 2>&1 \
   || die "curl is required to reach $BASE_URL, and it is not on PATH."
+
+[[ -n "$PYTHON" ]] \
+  || die "python3 is required for the Numes translation proxy.
+       Install Python 3.8+ and re-run, or set ZIM_CLAUDE_PYTHON."
+"$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' \
+  2>/dev/null \
+  || die "Python 3.8+ is required for the Numes translation proxy: $PYTHON"
 
 # --- the terminal ------------------------------------------------------------
 #
@@ -113,7 +133,7 @@ sanitize() {
 
 # --- the API key -------------------------------------------------------------
 
-API_KEY="${ZIM_CLAUDE_API_KEY:-${COARENA_API_KEY:-}}"
+API_KEY="${ZIM_CLAUDE_API_KEY:-${NUMES_API_KEY:-}}"
 API_KEY="$(sanitize "$API_KEY")"
 
 if [[ -z "$API_KEY" && -s "$KEY_FILE" ]]; then
@@ -123,32 +143,35 @@ fi
 # A key that arrived from the environment is not the user's to retype: if it is
 # rejected, say so and stop. Only a key typed at the prompt is worth re-asking.
 key_from_env=0
-[[ -n "${ZIM_CLAUDE_API_KEY:-}${COARENA_API_KEY:-}" ]] && key_from_env=1
+[[ -n "${ZIM_CLAUDE_API_KEY:-}${NUMES_API_KEY:-}" ]] && key_from_env=1
 
 # A key from a provider this package no longer routes to cannot work here, and
-# silently sending it to Coarena would read as "your key is broken". Name the
+# silently sending it to Numes would read as "your key is broken". Name the
 # real reason.
 case "$API_KEY" in
+  coa_*)
+    die "that is a Coarena key (coa_...), and this package now routes to Numes.
+       Create a Numes key at https://numes.ai/dashboard/keys." ;;
   tj_*)
-    die "that is a Token Juice key (tj_...), and this package no longer routes there.
-       Create a Coarena key at https://coarena.ai/account/api." ;;
+    die "that is a Token Juice key (tj_...), and this package does not route there.
+       Create a Numes key at https://numes.ai/dashboard/keys." ;;
   thk_*)
-    die "that is a TokenHarbor key (thk_...), and this package now routes to Coarena.
-       Create a Coarena key at https://coarena.ai/account/api." ;;
+    die "that is a TokenHarbor key (thk_...), and this package now routes to Numes.
+       Create a Numes key at https://numes.ai/dashboard/keys." ;;
 esac
 
-# The same rule for the base URL: pointing zim-claude at a provider this
+# The same rule for the API root: pointing zim-claude at a provider this
 # package no longer supports is not a configuration worth running.
 case "${ZIM_CLAUDE_BASE_URL:-}" in
-  *tokenjuice*|*tokenharbor*)
+  *coarena*|*tokenjuice*|*tokenharbor*)
     die "ZIM_CLAUDE_BASE_URL names a provider this package no longer routes to.
-       Unset ZIM_CLAUDE_BASE_URL to use Coarena (https://coarena.ai/api)." ;;
+       Unset it to use Numes (https://api.numes.ai/api/v1)." ;;
 esac
 
 ask_key() {
   open_tty || return 1
   printf '\n' >&2
-  info "Coarena API key — create one at https://coarena.ai/account/api"
+  info "Numes API key - create one at https://numes.ai/dashboard/keys"
   printf '  paste it here (input is hidden): ' >&2
   local typed=""
   IFS= read -r -s typed <&3 || typed=""
@@ -169,12 +192,12 @@ remember_key() {
   chmod 600 -- "$KEY_FILE" 2>/dev/null || true
 }
 
-# --- talking to Coarena ------------------------------------------------------
+# --- talking to Numes --------------------------------------------------------
 
 HTTP_CODE=""
 HTTP_BODY=""
-#: The /v1/limits payload, kept separately: the picker prints the day's
-#: remaining budget, and by the time it runs HTTP_BODY holds the catalog.
+#: The /key payload, kept separately: the picker prints the remaining budget,
+#: and by the time it runs HTTP_BODY holds the catalog.
 LIMITS_BODY=""
 
 api_get() {
@@ -191,122 +214,209 @@ api_get() {
   [[ "$HTTP_CODE" =~ ^[0-9]{3}$ ]] || HTTP_CODE=000
 }
 
-# Pull `"id":"..."` out of the models payload. grep/sed only — jq and python3
-# are not dependencies of this package, and the shape here is one flat list.
-parse_model_ids() {
-  grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
-    | sed -E 's/.*"id"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
-}
-
-# `id<TAB>display_name<TAB>context_length` per model, when python3 is around to
-# read the JSON properly. Falls back to bare ids, which the picker then labels
-# with the id — a cosmetic loss, never a functional one.
+# `id<TAB>name<TAB>context_length<TAB>prompt<TAB>completion<TAB>max_output`
+# per model. Numes' /models response is one flat list, so python3 reads it
+# properly; unlike the old wrapper there is no sed fallback, because the proxy
+# this route needs is Python anyway.
 #
 # The context length is carried because Claude Code has no catalog entry for a
-# non-Anthropic id and therefore assumes a 1M-token window for it. Coarena's
+# Numes id and therefore assumes a 1M-token window for it. Some catalogue
 # models are 128k, so that guess is 8x too generous and auto-compact would fire
-# far too late — the request would 400 on length before compaction ever ran.
+# far too late - the request would 400 on length before compaction ever ran.
 # The wrapper feeds the real number to CLAUDE_CODE_AUTO_COMPACT_WINDOW.
+#
+# Prices are per token, as decimal strings. They are carried untouched so the
+# picker can show "$0 in / $0 out" as "free" without inventing precision.
 parse_models() {
-  if command -v python3 >/dev/null 2>&1; then
-    printf '%s' "$HTTP_BODY" | python3 -c '
-import json, sys
+  printf '%s' "$HTTP_BODY" | "$PYTHON" -c '
+import json, os, sys
+
 try:
     data = json.load(sys.stdin).get("data") or []
 except Exception:
     sys.exit(0)
-for e in data:
-    if not isinstance(e, dict):
+
+free_only = os.environ.get("ZIM_CLAUDE_FREE_ONLY") == "1"
+rows = []
+for entry in data:
+    if not isinstance(entry, dict):
         continue
-    mid = str(e.get("id") or "").strip()
-    if not mid:
+    model = str(entry.get("id") or "").strip()
+    if not model:
         continue
-    name = str(e.get("display_name") or "").strip()
-    ctx = e.get("context_length")
+    name = str(entry.get("name") or model).replace("\t", " ").replace("\n", " ")
+    ctx = entry.get("context_length")
     ctx = str(ctx) if isinstance(ctx, int) and ctx > 0 else ""
-    print(mid + "\t" + name + "\t" + ctx)
-' 2>/dev/null && return 0
-  fi
-  local id
-  while IFS= read -r id; do
-    [[ -n "$id" ]] && printf '%s\t\t\n' "$id"
-  done <<<"$(printf '%s\n' "$HTTP_BODY" | parse_model_ids || true)"
+    max_out = entry.get("maximum_output_length")
+    if not isinstance(max_out, int) or max_out <= 0:
+        max_out = entry.get("maximum_output_tokens")
+    max_out = str(max_out) if isinstance(max_out, int) and max_out > 0 else ""
+    pricing = entry.get("pricing") if isinstance(entry.get("pricing"), dict) else {}
+    prompt = pricing.get("prompt")
+    completion = pricing.get("completion")
+    prompt = str(prompt) if prompt is not None else ""
+    completion = str(completion) if completion is not None else ""
+    try:
+        total = float(prompt) + float(completion)
+    except Exception:
+        total = float("inf")
+    if free_only and total != 0:
+        continue
+    rows.append((total, model, name, ctx, prompt, completion, max_out))
+
+rows.sort(key=lambda row: (row[0], row[1]))
+for _, model, name, ctx, prompt, completion, max_out in rows:
+    print("\t".join((model, name, ctx, prompt, completion, max_out)))
+' 2>/dev/null || true
 }
 
-# The context window the catalog advertises for one model id, or empty when the
-# payload did not carry one (no python3, or an older catalog).
-model_context_length() {
-  local line id ctx
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    id="${line%%$'\t'*}"
-    [[ "$id" == "$1" ]] || continue
-    ctx="${line##*$'\t'}"
-    [[ "$ctx" =~ ^[0-9]+$ ]] && printf '%s' "$ctx"
+# One field out of the catalog row for a model id. Returns empty when the model
+# is not in the list (a pinned id that the key cannot see, for example).
+model_field() {
+  local wanted="$1" field="$2" line
+  local id name ctx prompt completion max_out
+  while IFS=$'\t' read -r id name ctx prompt completion max_out; do
+    [[ "$id" == "$wanted" ]] || continue
+    case "$field" in
+      ctx)        printf '%s' "$ctx" ;;
+      prompt)     printf '%s' "$prompt" ;;
+      completion) printf '%s' "$completion" ;;
+      max_out)    printf '%s' "$max_out" ;;
+    esac
     return 0
   done <<<"$ALL_MODELS"
   return 0
 }
 
-# The day's remaining allowance, from the /limits payload. Printed beside the
-# model list because "free" here means no per-token charge, not no ceiling: the
-# account is metered in real dollars against a daily budget. Best-effort — a
-# payload we cannot read simply prints nothing.
+# The day's remaining allowance / usage, from the /key payload. Printed beside
+# the model list because "free" here means a $0 price, not an unlimited
+# account: paid models draw down the key's balance.
 budget_line() {
-  command -v python3 >/dev/null 2>&1 || return 0
   [[ -n "$LIMITS_BODY" ]] || return 0
-  printf '%s' "$LIMITS_BODY" | python3 -c '
+  printf '%s' "$LIMITS_BODY" | "$PYTHON" -c '
 import json, sys
+
 try:
-    d = json.load(sys.stdin).get("data") or {}
-    today = d.get("today") or {}
-    left = today.get("left_usd")
-    cap = d.get("usd_per_day")
-    if left is None or cap is None:
-        sys.exit(0)
-    print(f"${left:.2f} of ${cap:.2f} left today")
+    data = json.load(sys.stdin).get("data") or {}
 except Exception:
-    pass
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+
+def money(value, currency):
+    try:
+        number = float(value)
+    except Exception:
+        return ""
+    if currency == "BTC":
+        return ("%g sats" % number)
+    return ("$%.2f" % number)
+
+currency = data.get("billing_currency") or "USD"
+limit = data.get("limit")
+remaining = data.get("limit_remaining")
+usage = data.get("usage")
+if data.get("disabled"):
+    print("key disabled")
+elif limit is not None and remaining is not None:
+    print("%s of %s left" % (money(remaining, currency), money(limit, currency)))
+elif usage is not None:
+    print("%s used" % money(usage, currency))
 ' 2>/dev/null || true
 }
+
+key_is_disabled() {
+  printf '%s' "$LIMITS_BODY" | grep -q '"disabled"[[:space:]]*:[[:space:]]*true'
+}
+
+# The key's billing currency. Numes returns prices in that currency, so a USD
+# key gets "$/M" and a BTC key gets satoshis per million; printing "$" for a BTC
+# price would be wrong by orders of magnitude.
+billing_currency() {
+  [[ -n "$LIMITS_BODY" ]] || { printf 'USD'; return; }
+  printf '%s' "$LIMITS_BODY" | "$PYTHON" -c '
+import json, sys
+try:
+    data = json.load(sys.stdin).get("data") or {}
+    print(data.get("billing_currency") or "USD")
+except Exception:
+    print("USD")
+' 2>/dev/null || printf 'USD'
+}
+
+CURRENCY="USD"
 
 # --- the model picker --------------------------------------------------------
 
 MODEL=""
-ALL_MODELS=""   # id<TAB>display_name<TAB>context_length lines
+ALL_MODELS=""
+
+price_label() {
+  local prompt="$1" completion="$2" pin pout
+  [[ -n "$prompt" && -n "$completion" ]] || { printf '?'; return; }
+  if awk -v p="$prompt" -v c="$completion" 'BEGIN { exit !(p == 0 && c == 0) }'; then
+    printf 'free'
+    return
+  fi
+  pin="$(awk -v x="$prompt" 'BEGIN { printf "%.4g", x * 1000000 }')"
+  pout="$(awk -v x="$completion" 'BEGIN { printf "%.4g", x * 1000000 }')"
+  if [[ "$CURRENCY" == "BTC" ]]; then
+    printf '%s/%s sats per M' "$pin" "$pout"
+  else
+    printf '$%s/$%s per M' "$pin" "$pout"
+  fi
+}
+
+ctx_label() {
+  local number="$1"
+  [[ -n "$number" ]] || { printf '?'; return; }
+  awk -v n="$number" 'BEGIN {
+    if (n >= 1000000) printf "%.1fM", n / 1000000
+    else if (n >= 1000) printf "%.0fk", n / 1000
+    else printf "%d", n
+  }'
+}
 
 choose_model() {
-  local -a ids=() labels=()
-  local line id label rest
+  local -a ids=() labels=() prices=() ctxs=()
+  local line id label ctx prompt completion max_out
+  local free_count=0
 
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    id="${line%%$'\t'*}"
-    rest="${line#*$'\t'}"
-    label="${rest%%$'\t'*}"
+  while IFS=$'\t' read -r id label ctx prompt completion max_out; do
     [[ -n "$id" ]] || continue
     ids+=("$id")
-    labels+=("$label")
+    labels+=("${label:-$id}")
+    prices+=("$(price_label "$prompt" "$completion")")
+    ctxs+=("$(ctx_label "$ctx")")
+    if [[ "$(price_label "$prompt" "$completion")" == "free" ]]; then
+      free_count=$((free_count + 1))
+    fi
   done <<<"$ALL_MODELS"
 
-  (( ${#ids[@]} > 0 )) || die "$BASE_URL/v1/models returned no models."
+  (( ${#ids[@]} > 0 )) || die "$BASE_URL/models returned no models."
 
   # A pinned model is an override, not a preference: take it as given so a
   # script can pin a model without the picker getting in the way.
   if [[ -n "${ZIM_CLAUDE_MODEL:-}" ]]; then
     MODEL="$ZIM_CLAUDE_MODEL"
+    local found=0
+    for i in "${!ids[@]}"; do
+      [[ "${ids[$i]}" == "$MODEL" ]] && found=1
+    done
+    if (( ! found )); then
+      warn "$MODEL is not in the tool-capable catalogue this key can see; using it anyway."
+    fi
     return 0
   fi
 
   # Default to last time's pick when it is still on offer, so pressing Enter
   # repeatedly is stable instead of drifting to whatever sorts first. A fresh
   # install starts on DEFAULT_MODEL when the catalog still lists it.
-  local default_n=1 previous=""
+  local default_n=1 previous="" i
   if [[ -r "$LAST_MODEL_FILE" ]]; then
     previous="$(sanitize "$(cat "$LAST_MODEL_FILE" 2>/dev/null || true)")"
   fi
   [[ -n "$previous" ]] || previous="$DEFAULT_MODEL"
-  local i
   for i in "${!ids[@]}"; do
     if [[ "${ids[$i]}" == "$previous" ]]; then
       default_n=$((i + 1))
@@ -316,20 +426,20 @@ choose_model() {
   open_tty || die "no terminal to choose a model on.
        Set ZIM_CLAUDE_MODEL=<model-id> to skip the picker."
 
-  local budget; budget="$(budget_line)"
+  local budget summary
+  budget="$(budget_line)"
+  summary="${#ids[@]} tool-capable"
+  (( free_count > 0 )) && summary+=", $free_count free"
+  [[ "${ZIM_CLAUDE_FREE_ONLY:-0}" == "1" ]] && summary="free models only"
   printf '\n' >&2
   if [[ -n "$budget" ]]; then
-    info "models on ${BASE_URL#https://} — $budget"
+    info "models on ${BASE_URL#https://} - $summary - $budget"
   else
-    info "models on ${BASE_URL#https://}"
+    info "models on ${BASE_URL#https://} - $summary"
   fi
   for i in "${!ids[@]}"; do
-    label="${labels[$i]}"
-    if [[ -n "$label" ]]; then
-      printf '  %2d) %-26s %s\n' "$((i + 1))" "${ids[$i]}" "$label" >&2
-    else
-      printf '  %2d) %s\n' "$((i + 1))" "${ids[$i]}" >&2
-    fi
+    printf '  %2d) %-46s %-24s %-16s %s\n' \
+      "$((i + 1))" "${ids[$i]}" "${labels[$i]}" "${prices[$i]}" "${ctxs[$i]}" >&2
   done
 
   local reply="" choice=""
@@ -357,48 +467,36 @@ remember_model() {
 # --- the model picker inside Claude Code -------------------------------------
 #
 # `/model` lists Claude Code's built-in lineup, which knows nothing about
-# Coarena's ids. Two mechanisms can change that:
+# Numes' ids. Two mechanisms can change that:
 #
 #   * CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 asks Claude Code to read
-#     /v1/models itself — but it keeps only ids containing "claude" or
-#     "anthropic", so on Coarena it would surface only the Claude ids and hide
-#     deepseek, gemini, kimi, grok, qwen, glm, hy4, mimo and minimax.
+#     /v1/models itself - but it keeps only ids containing "claude" or
+#     "anthropic", so on Numes it would hide deepseek, google, kimi, qwen,
+#     mistral and the rest.
 #   * the `modelPicker` settings key lists any id, in any order, under any
 #     label, with no filter at all.
 #
 # So the wrapper writes a settings file and passes it with `--settings`, which
 # applies to this session only. Nothing is written to ~/.claude/settings.json:
-# these models exist only while routed through Coarena, and a plain `claude`
+# these models exist only while routed through Numes, and a plain `claude`
 # in another terminal must not inherit them.
 #
-# `replaceBuiltInOptions` is on because the built-in rows (Opus 5.5, Sonnet
-# 5.5, ...) are Anthropic-API ids that Coarena does not serve under those
-# names; leaving them in the picker would offer rows that 404 on selection.
+# `replaceBuiltInOptions` is on because the built-in rows are Anthropic-API ids
+# that Numes does not serve under those names; leaving them in the picker would
+# offer rows that 404 on selection.
 #
-# `behavesAs` is set on the rows Claude Code does not know — every non-Claude
-# id. Without it Claude Code has no catalog entry for the model, so it assumes
-# a 1M-token window and prints a warning on every single run:
-#
-#   Claude Code doesn't recognize the model "deepseek-v4-1-flash-1017", so it
-#   assumes a context window of 1m tokens.
-#
-# `behavesAs` borrows a known model's client-side handling (prompt profile,
-# capability and effort defaults) without changing the id that is sent. It
-# does NOT set the window — it inherits the borrowed model's, which is 200k for
-# claude-sonnet-4-5 — so the real 128k is applied separately through
-# CLAUDE_CODE_AUTO_COMPACT_WINDOW below. The two together are what make a
-# Coarena session quiet and correctly bounded; either one alone is not.
-#
-# Claude ids are left alone: Claude Code already knows them, and overriding
-# their handling would be a downgrade.
+# `behavesAs` is set on every row. None of them is an id Claude Code knows -
+# even the Claude models are `anthropic/claude-*`, not `claude-*` - so without
+# it Claude Code assumes a 1M-token window and prints an unrecognized-model
+# warning on every run. `behavesAs` borrows a known model's client-side
+# handling (prompt profile, capability and effort defaults) without changing
+# the id that is sent. It does NOT set the window, which is applied separately
+# through CLAUDE_CODE_AUTO_COMPACT_WINDOW below.
 
-# The model whose client-side handling a non-Claude Coarena id borrows. Sonnet
-# is the closest match for a general tool-calling model, and it is a stable id
-# that will not be retired out from under the picker.
 BEHAVES_AS="claude-sonnet-4-5"
 
 json_escape() {
-  # Model ids are [a-z0-9.-] and display names are plain text, but a stray
+  # Model ids are [a-z0-9./_-] and display names are plain text, but a stray
   # quote or backslash must not produce a settings file Claude Code rejects.
   printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
@@ -412,24 +510,14 @@ write_settings_file() {
   SETTINGS_WRITTEN=0
   [[ "${ZIM_CLAUDE_NO_PICKER:-0}" == "1" ]] && return 0
 
-  local line id label rest first=1
+  local line id label ctx prompt completion max_out first=1
   local body=""
-  while IFS= read -r line; do
-    [[ -n "$line" ]] || continue
-    id="${line%%$'\t'*}"
-    rest="${line#*$'\t'}"
-    label="${rest%%$'\t'*}"
+  while IFS=$'\t' read -r id label ctx prompt completion max_out; do
     [[ -n "$id" ]] || continue
     [[ -n "$label" ]] || label="$id"
     (( first )) || body+=","$'\n'
     first=0
-    body+="    {\"model\": \"$(json_escape "$id")\", \"label\": \"$(json_escape "$label")\""
-    # Only ids Claude Code does not already know need the borrowed handling.
-    case "$id" in
-      claude-*) ;;
-      *) body+=", \"behavesAs\": \"$(json_escape "$BEHAVES_AS")\"" ;;
-    esac
-    body+="}"
+    body+="    {\"model\": \"$(json_escape "$id")\", \"label\": \"$(json_escape "$label")\", \"behavesAs\": \"$(json_escape "$BEHAVES_AS")\"}"
   done <<<"$ALL_MODELS"
 
   [[ -n "$body" ]] || return 0
@@ -458,33 +546,50 @@ attempt=0
 while :; do
   if [[ -z "$API_KEY" ]]; then
     if ! ask_key; then
-      die "a Coarena API key is required.
-       Get one at https://coarena.ai/account/api, then either paste it when
-       prompted, or export ZIM_CLAUDE_API_KEY and re-run."
+      die "a Numes API key is required.
+       Get one at https://numes.ai/dashboard/keys, then either paste it when
+       prompted, or export NUMES_API_KEY and re-run."
     fi
   fi
 
-  # /v1/limits is the credential probe: 401 without a key, 200 with one. The
-  # catalog at /v1/models answers 200 with no key at all, so it cannot tell a
-  # good key from a missing one — probing it would accept any string.
-  api_get /v1/limits
+  # /key is the credential probe: 401 without a valid key, 200 with one. It
+  # also carries the key's limit, remaining balance and usage, which is the
+  # only budget figure an inference key is allowed to read (/credits needs a
+  # management key).
+  api_get /key
 
   case "$HTTP_CODE" in
-    200) LIMITS_BODY="$HTTP_BODY"; break ;;
+    200)
+      LIMITS_BODY="$HTTP_BODY"
+      if key_is_disabled; then
+        die "this Numes key is disabled.
+       Enable or create one at https://numes.ai/dashboard/keys."
+      fi
+      CURRENCY="$(billing_currency)"
+      break
+      ;;
     401|403)
       if (( key_from_env )); then
-        die "Coarena rejected ZIM_CLAUDE_API_KEY (HTTP $HTTP_CODE).
-       Rotate it at https://coarena.ai/account/api."
+        die "Numes rejected ZIM_CLAUDE_API_KEY (HTTP $HTTP_CODE).
+       Rotate it at https://numes.ai/dashboard/keys."
       fi
       attempt=$((attempt + 1))
-      warn "Coarena rejected that key (HTTP $HTTP_CODE)."
+      warn "Numes rejected that key (HTTP $HTTP_CODE)."
       if (( attempt >= 3 )); then
         die "giving up after 3 rejected keys.
-       Create or rotate one at https://coarena.ai/account/api."
+       Create or rotate one at https://numes.ai/dashboard/keys."
       fi
       rm -f -- "$KEY_FILE" 2>/dev/null || true
       API_KEY=""
       continue
+      ;;
+    402)
+      die "Numes cannot fund this request: the account is on a funding hold.
+       Add credits at https://numes.ai/dashboard/billing, or use a free model."
+      ;;
+    429)
+      die "Numes is rate-limiting this key (HTTP 429).
+       Wait a moment and retry."
       ;;
     000)
       die "could not reach $BASE_URL.
@@ -492,7 +597,7 @@ while :; do
        somewhere else."
       ;;
     *)
-      die "$BASE_URL/v1/limits answered HTTP $HTTP_CODE.
+      die "$BASE_URL/key answered HTTP $HTTP_CODE.
        ${HTTP_BODY:0:300}"
       ;;
   esac
@@ -500,51 +605,172 @@ done
 
 remember_key
 
-# The catalog is public, so this is a second request rather than a reuse of the
-# probe above — /limits carries the budget, /models carries the lineup.
-api_get /v1/models
+# The catalogue is filtered to models that can drive Claude Code: text output
+# and tool calling. The OS sort is by price, so the genuinely free models come
+# first. If a key can see no tool-capable model, retry unfiltered and warn
+# rather than showing an empty menu.
+api_get "/models?output_modalities=text&supported_parameters=tools&sort=pricing-low-to-high"
 case "$HTTP_CODE" in
   200) ;;
-  000) die "could not reach $BASE_URL/v1/models.
+  503) die "Numes' catalogue is temporarily unavailable (HTTP 503).
+       Retry in a minute; the endpoint publishes a new snapshot every 30s." ;;
+  000) die "could not reach $BASE_URL/models.
        Check your connection, or set ZIM_CLAUDE_BASE_URL." ;;
-  *)   die "$BASE_URL/v1/models answered HTTP $HTTP_CODE.
+  *)   die "$BASE_URL/models answered HTTP $HTTP_CODE.
        ${HTTP_BODY:0:300}" ;;
 esac
 
 ALL_MODELS="$(parse_models || true)"
-[[ -n "$ALL_MODELS" ]] \
-  || die "$BASE_URL/v1/models returned no model ids.
+if [[ -z "$ALL_MODELS" ]]; then
+  warn "no tool-capable models matched; retrying the catalogue without the tools filter."
+  api_get "/models?output_modalities=text&sort=pricing-low-to-high"
+  case "$HTTP_CODE" in
+    200) ALL_MODELS="$(parse_models || true)" ;;
+    *)   die "$BASE_URL/models answered HTTP $HTTP_CODE.
+       ${HTTP_BODY:0:300}" ;;
+  esac
+fi
+
+if [[ -z "$ALL_MODELS" ]]; then
+  if [[ "${ZIM_CLAUDE_FREE_ONLY:-0}" == "1" ]]; then
+    die "no free tool-capable models are listed for this key.
+       Unset ZIM_CLAUDE_FREE_ONLY to see the paid catalogue."
+  fi
+  die "$BASE_URL/models returned no models this key can use.
        ${HTTP_BODY:0:300}"
+fi
 
 choose_model
 remember_model
 write_settings_file
 
-# --- hand off ----------------------------------------------------------------
+# --- the translation proxy ---------------------------------------------------
+#
+# Claude Code sends Anthropic Messages; Numes accepts OpenAI Chat Completions.
+# The proxy translates both directions, including native tool calls and SSE.
+# It listens on loopback only, on a port the kernel picks, for this session.
+
+PROXY_BASE="${ZIM_CLAUDE_PROXY_URL:-}"
+PROXY_BASE="${PROXY_BASE%/}"
+_proxy_pid=""
+_port_file=""
+_proxy_log="$STATE_DIR/numes-proxy.log"
+
+cleanup_proxy() {
+  local status=$?
+  if [[ -n "${_proxy_pid:-}" ]]; then
+    kill "$_proxy_pid" 2>/dev/null || true
+    wait "$_proxy_pid" 2>/dev/null || true
+    _proxy_pid=""
+  fi
+  if [[ -n "${_port_file:-}" ]]; then
+    rm -f -- "$_port_file" 2>/dev/null || true
+    _port_file=""
+  fi
+  return "$status"
+}
+
+start_proxy() {
+  [[ -n "$PROXY_BASE" ]] && return 0
+
+  [[ -f "$PROXY_BIN" ]] \
+    || die "the Numes translation proxy is missing: $PROXY_BIN
+       Re-run install.sh, or set ZIM_CLAUDE_PROXY_BIN."
+
+  mkdir -p -- "$STATE_DIR" 2>/dev/null || true
+  chmod 700 -- "$STATE_DIR" 2>/dev/null || true
+
+  # Keep the log bounded. It is append-only, and only read when startup fails.
+  if [[ -f "$_proxy_log" ]] && (( $(wc -c <"$_proxy_log" 2>/dev/null || echo 0) > 262144 )); then
+    mv -f -- "$_proxy_log" "$_proxy_log.1" 2>/dev/null || true
+  fi
+
+  _port_file="$STATE_DIR/numes-proxy-$$.port"
+  rm -f -- "$_port_file" 2>/dev/null || true
+
+  local maxout
+  maxout="$(model_field "$MODEL" max_out)"
+  [[ -n "$maxout" ]] || maxout=0
+
+  # Parent pid: the proxy exits if this wrapper disappears without cleanup.
+  # The key is explicitly unset in the proxy's environment: Claude Code sends
+  # it on each request as a bearer token, so a local process that finds the
+  # port still cannot spend the user's balance.
+  (
+    unset NUMES_API_KEY ZIM_CLAUDE_API_KEY
+    exec "$PYTHON" "$PROXY_BIN" \
+      --port 0 \
+      --port-file "$_port_file" \
+      --model "$MODEL" \
+      --upstream "$BASE_URL" \
+      --max-output "$maxout" \
+      --parent-pid $$ \
+      >>"$_proxy_log" 2>&1 </dev/null
+  ) &
+  _proxy_pid=$!
+
+  local i
+  for ((i = 0; i < 50; i++)); do
+    [[ -s "$_port_file" ]] && break
+    if ! kill -0 "$_proxy_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if [[ ! -s "$_port_file" ]]; then
+    warn "the Numes translation proxy did not start; log: $_proxy_log"
+    tail -n 20 "$_proxy_log" 2>/dev/null >&2 || true
+    die "cannot start the Numes translation proxy."
+  fi
+
+  local port
+  port="$(sanitize "$(cat "$_port_file" 2>/dev/null || true)")"
+  [[ "$port" =~ ^[0-9]+$ ]] \
+    || die "the Numes translation proxy reported an invalid port: $port"
+
+  PROXY_BASE="http://127.0.0.1:$port"
+
+  if ! curl -fsS --max-time 3 "$PROXY_BASE/health" >/dev/null 2>&1; then
+    warn "the Numes translation proxy is not answering; log: $_proxy_log"
+    tail -n 20 "$_proxy_log" 2>/dev/null >&2 || true
+    die "the Numes translation proxy failed its health check."
+  fi
+}
 
 close_tty
 
+# Every exit path from here stops the proxy. SIGINT/SIGTERM are turned into an
+# exit so the EXIT trap runs even when the user interrupts Claude Code.
+trap cleanup_proxy EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+start_proxy
+
+# --- hand off ----------------------------------------------------------------
+
 # Report the override rather than silently changing provider.
-if [[ -n "$_prev_base_url" && "$_prev_base_url" != "$BASE_URL" ]]; then
+if [[ -n "$_prev_base_url" && "$_prev_base_url" != "$PROXY_BASE" ]]; then
   case "$_prev_base_url" in
-    *tokenjuice*|*tokenharbor*|*localhost:4*|*127.0.0.1:4*)
+    *tokenjuice*|*tokenharbor*|*coarena*|*localhost:4*|*127.0.0.1:4*)
       warn "ignoring inherited ANTHROPIC_BASE_URL=$_prev_base_url" ;;
     *)
-      warn "overriding inherited ANTHROPIC_BASE_URL=$_prev_base_url -> $BASE_URL" ;;
+      warn "overriding inherited ANTHROPIC_BASE_URL=$_prev_base_url -> $PROXY_BASE" ;;
   esac
 fi
 
 info "model: $MODEL"
 
-# Process-scoped only: plain `claude` in this shell is untouched.
-export ANTHROPIC_BASE_URL="$BASE_URL"
+# Process-scoped only: plain `claude` in this shell is untouched. Claude Code
+# sends the Numes key as a bearer token; the proxy forwards it upstream.
+export ANTHROPIC_BASE_URL="$PROXY_BASE"
 export ANTHROPIC_AUTH_TOKEN="$API_KEY"
 export ANTHROPIC_MODEL="$MODEL"
 
 # Claude Code names its background and /model-picker calls after Anthropic
-# tiers. There is no proxy to rewrite those names, so point every tier at the
-# model that was chosen — otherwise `/model sonnet` asks Coarena for
-# "claude-sonnet-4-5" and gets a 404.
+# tiers. There is no reason to let those names reach Numes, which has no such
+# ids, so point every tier at the model that was chosen.
 export ANTHROPIC_SMALL_FAST_MODEL="$MODEL"
 export ANTHROPIC_DEFAULT_HAIKU_MODEL="$MODEL"
 export ANTHROPIC_DEFAULT_SONNET_MODEL="$MODEL"
@@ -552,7 +778,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL="$MODEL"
 
 # Load-bearing. Claude Code prefers ANTHROPIC_AUTH_TOKEN (sent as
 # `Authorization: Bearer ...`) and falls back to ANTHROPIC_API_KEY (`x-api-key`)
-# on a truthiness test, so an empty string means the auth token wins — and it
+# on a truthiness test, so an empty string means the auth token wins - and it
 # also clears any real ANTHROPIC_API_KEY inherited from the shell.
 export ANTHROPIC_API_KEY=""
 
@@ -571,28 +797,31 @@ for _a in "$@"; do
 done
 
 if (( _user_has_settings )); then
-  warn "your --settings wins; Coarena models will not be added to /model"
+  warn "your --settings wins; Numes models will not be added to /model"
 elif (( SETTINGS_WRITTEN )) && [[ -s "$SETTINGS_FILE" ]]; then
   _claude_args+=(--settings "$SETTINGS_FILE")
 fi
 
 # --- the context window ------------------------------------------------------
 #
-# Claude Code has no catalog entry for a non-Anthropic id, so it assumes a
-# 1M-token window. Coarena's models are 128k. Left alone, auto-compact would
-# wait for 1M tokens of history and the request would 400 on length long before
-# that — the session dies instead of compacting.
+# Claude Code has no catalog entry for a Numes id, so it assumes a 1M-token
+# window. Several catalogue models are 128k or 200k. Left alone, auto-compact
+# would wait for 1M tokens of history and the request would 400 on length long
+# before that - the session dies instead of compacting.
 #
 # CLAUDE_CODE_AUTO_COMPACT_WINDOW is the lever that actually moves the window
 # Claude Code plans against (CLAUDE_CODE_MAX_CONTEXT_TOKENS only silences the
 # warning and leaves the 1M assumption in place). The number comes from the
 # catalog's own context_length, so it follows the model rather than being
 # hardcoded here.
-#
-# Only set when the catalog gave us a number: an unset variable is better than
-# a wrong one, and Claude Code's own default is right for a Claude id.
-_ctx="$(model_context_length "$MODEL")"
+_ctx="$(model_field "$MODEL" ctx)"
 if [[ -n "$_ctx" ]]; then
+  # Claude Code caps the window it accepts at 1,000,000 and warns above it.
+  # Numes advertises 1,048,576 for some models; clamping keeps the session
+  # quiet and leaves only the last 48k unused.
+  if (( _ctx > 1000000 )); then
+    _ctx=1000000
+  fi
   export CLAUDE_CODE_AUTO_COMPACT_WINDOW="$_ctx"
 fi
 
@@ -621,6 +850,12 @@ maybe_self_update() {
 
 maybe_self_update
 
-# exec: no extra bash layer, so exit status, signal delivery and TTY ownership
-# all belong to claude. NOTE: exec discards EXIT traps — do not add one here.
-exec "$CLAUDE_BIN" "${_claude_args[@]}" "$@"
+# No exec: the proxy is a child of this shell and must be stopped when claude
+# exits. Running claude in the foreground keeps its TTY, exit status and signal
+# delivery intact; the EXIT trap does the cleanup.
+_claude_status=0
+set +e
+"$CLAUDE_BIN" "${_claude_args[@]}" "$@"
+_claude_status=$?
+set -e
+exit "$_claude_status"

@@ -1,0 +1,999 @@
+#!/usr/bin/env python3
+"""zim-claude-numes-proxy - Anthropic Messages in, Numes chat completions out.
+
+Claude Code speaks the **Anthropic Messages API** (``POST /v1/messages``) and
+nothing else. Numes speaks the **OpenAI Chat Completions API** at
+``https://api.numes.ai/api/v1/chat/completions`` and has no Messages route --
+``/api/v1/messages`` answers 404 -- so this process translates between the two.
+
+It is deliberately small and stdlib-only: the wrapper starts one for the life
+of a session, points Claude Code at it on loopback, and kills it on exit. No
+key is stored here; the key arrives on every request in the ``Authorization``
+header that Claude Code already sends, with ``NUMES_API_KEY`` as a fallback for
+hand-driven use.
+
+What is translated
+------------------
+* system prompt, user/assistant messages, text and image blocks
+* ``tool_use`` blocks to OpenAI ``tool_calls``, and ``tool_result`` blocks to
+  OpenAI ``tool`` messages, including ids
+* OpenAI ``tool_calls`` back to Anthropic ``tool_use`` blocks, so Claude Code's
+  tool loop works natively -- this route supports real tool calling, so unlike
+  a prose-only gateway there is no prompt-emulated tool protocol here
+* ``max_tokens``, ``temperature``, ``top_p``, ``top_k``, ``stop_sequences``,
+  ``tool_choice`` and ``parallel_tool_calls``
+* streaming: Numes' SSE becomes Anthropic SSE, with text streamed live and
+  tool blocks flushed at the end of the turn
+* errors: Numes' OpenAI/OpenRouter envelope becomes an Anthropic error envelope
+
+Not translated (and why)
+------------------------
+* ``thinking`` / ``reasoning`` -- Numes accepts a ``reasoning`` object, but the
+  effort vocabulary and the Anthropic budget are not the same thing; omitting
+  it degrades gracefully instead of sending a field the chosen model rejects.
+* prompt-cache directives -- ``cache_control`` is accepted by some Numes
+  endpoints, but it is a cost optimisation, not correctness, and mapping the
+  block-level form is lossy.
+* images in tool results -- the OpenAI tool message carries text only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+#: The API root. Numes appends nothing else: chat lives at /chat/completions.
+DEFAULT_UPSTREAM = "https://api.numes.ai/api/v1"
+
+#: A tool-capable, free model on the catalogue. The wrapper overrides this with
+#: the model the user picked.
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
+
+#: Claude Code itself is the only client; 32 MiB is far beyond any real turn.
+MAX_BODY = 32 * 1024 * 1024
+
+#: Numes caps max_tokens at 131,072. The wrapper passes the selected model's
+#: own ceiling, which is usually lower.
+MAX_OUTPUT_HARD_CAP = 131072
+
+#: Borrowed client-side handling for the /model picker. This proxy does not use
+#: it, but keeping the name here documents why every Numes id needs behavesAs,
+#: and the tests assert it is the same value the wrapper writes.
+BEHAVES_AS = "claude-sonnet-4-5"
+
+
+class UpstreamError(Exception):
+    """A failure from Numes, already turned into a sentence for the user."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _error_envelope(kind: str, message: str) -> dict:
+    return {"type": "error", "error": {"type": kind, "message": message}}
+
+
+def _kind_for(status: int) -> str:
+    if status == 401:
+        return "authentication_error"
+    if status == 403:
+        return "permission_error"
+    if status == 404:
+        return "not_found_error"
+    if status == 429:
+        return "rate_limit_error"
+    if status in (400, 422):
+        return "invalid_request_error"
+    return "api_error"
+
+
+def explain_failure(status: int, body: str) -> str:
+    """A sentence a user can act on, from Numes' error envelope.
+
+    Numes sometimes reports failures as HTTP 200 with an ``error`` frame (the
+    playground did), so ``status`` may be 200 and the frame is the whole story.
+    """
+    text = (body or "").strip()
+    detail = ""
+    error_type = ""
+    try:
+        payload = json.loads(text) if text else {}
+    except ValueError:
+        payload = {}
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            detail = str(error.get("message") or "")
+            metadata = error.get("metadata")
+            if isinstance(metadata, dict):
+                error_type = str(metadata.get("error_type") or "")
+        if not detail:
+            detail = str(payload.get("detail") or payload.get("message") or "")
+    lowered = (detail or text).lower()
+
+    if status == 401 or "invalid api key" in lowered or "unauthorized" in lowered:
+        return ("Numes rejected the API key. Create or rotate one at "
+                "https://numes.ai/dashboard/keys.")
+    if status == 402 or error_type == "funding_held":
+        return ("the Numes account cannot fund this request. Add credits at "
+                "https://numes.ai/dashboard/billing, or use a free model.")
+    if status == 403:
+        return f"Numes refused the request (HTTP 403): {detail[:200] or 'forbidden'}"
+    if status == 429 or "rate limit" in lowered:
+        return ("Numes rate-limited the request. Wait a moment and retry, or "
+                "pick a less busy model.")
+    if status == 503 or error_type == "provider_unavailable":
+        return ("no Numes endpoint could serve this model with the requested "
+                "features. Pick a tool-capable model, or retry; the catalogue "
+                "moves. " + (detail[:160] if detail else "")).strip()
+    if "maximum" in lowered and "token" in lowered:
+        return f"the model rejected the requested max_tokens: {detail[:200]}"
+    if detail:
+        return f"Numes answered HTTP {status}: {detail[:300]}"
+    if status == 200:
+        return "Numes reported an error in the response stream."
+    return f"Numes answered HTTP {status}."
+
+
+# ---------------------------------------------------------------------------
+# Anthropic content -> OpenAI content
+# ---------------------------------------------------------------------------
+
+
+def _blocks(content) -> list:
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if isinstance(content, list):
+        return [b for b in content if isinstance(b, dict)]
+    return [{"type": "text", "text": str(content)}]
+
+
+def flatten_text(content) -> str:
+    """Flatten Anthropic content (string or blocks) to plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            parts.append(str(block))
+            continue
+        kind = block.get("type")
+        if kind == "text":
+            parts.append(block.get("text") or "")
+        elif kind == "tool_use":
+            parts.append(
+                "[called tool %s with %s]"
+                % (block.get("name"),
+                   json.dumps(block.get("input") or {}, ensure_ascii=False))
+            )
+        elif kind == "tool_result":
+            body = flatten_text(block.get("content"))
+            if block.get("is_error"):
+                body = "Error: " + body if body else "Error"
+            parts.append("[tool result] " + body)
+        elif kind in ("image", "document"):
+            parts.append("[%s omitted - this route takes text here]" % kind)
+        elif kind in ("thinking", "redacted_thinking"):
+            # The model's private reasoning is not part of the task, and
+            # echoing it back is rejected by several providers.
+            continue
+    return "\n\n".join(p for p in parts if p)
+
+
+def _image_part(block: dict):
+    """Anthropic image block -> OpenAI image_url part, or None."""
+    source = block.get("source") or {}
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "base64" and source.get("data"):
+        media = source.get("media_type") or "image/png"
+        url = "data:%s;base64,%s" % (media, source.get("data"))
+    elif source.get("type") == "url" and source.get("url"):
+        url = str(source["url"])
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _tool_input(arguments) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        value = json.loads(arguments or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _tool_calls(blocks: list) -> list:
+    calls = []
+    for block in blocks:
+        if block.get("type") != "tool_use":
+            continue
+        name = block.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        call_id = block.get("id") or ("call_" + uuid.uuid4().hex[:24])
+        calls.append({
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": json.dumps(block.get("input") or {},
+                                        ensure_ascii=False),
+            },
+        })
+    return calls
+
+
+def anthropic_messages(system, messages) -> list:
+    """Build the OpenAI message array from Anthropic ``system`` + ``messages``."""
+    out: list = []
+    system_text = flatten_text(system).strip()
+    if system_text:
+        out.append({"role": "system", "content": system_text})
+
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role") or "user"
+        blocks = _blocks(message.get("content"))
+
+        if role == "assistant":
+            texts = []
+            for block in blocks:
+                if block.get("type") == "text":
+                    texts.append(block.get("text") or "")
+            calls = _tool_calls(blocks)
+            content = "\n\n".join(t for t in texts if t)
+            if not content and not calls:
+                continue
+            item = {"role": "assistant"}
+            # OpenAI accepts null content alongside tool_calls, and some
+            # gateways reject an empty string when tool calls are present.
+            item["content"] = content if content else None
+            if calls:
+                item["tool_calls"] = calls
+            out.append(item)
+            continue
+
+        # A user turn may carry tool results, text, and images. Tool results
+        # must become separate tool messages in the order they arrived.
+        tool_messages = []
+        parts = []
+        for block in blocks:
+            kind = block.get("type")
+            if kind == "tool_result":
+                result = flatten_text(block.get("content"))
+                if block.get("is_error"):
+                    result = "Error: " + result if result else "Error"
+                tool_messages.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id") or "call_unknown",
+                    "content": result or "(no output)",
+                })
+            elif kind == "text":
+                text = block.get("text") or ""
+                if text:
+                    parts.append({"type": "text", "text": text})
+            elif kind == "image":
+                part = _image_part(block)
+                if part:
+                    parts.append(part)
+            elif kind == "document":
+                parts.append({"type": "text",
+                              "text": "[document omitted - this route takes "
+                                      "images and text only]"})
+            elif kind in ("thinking", "redacted_thinking"):
+                continue
+
+        out.extend(tool_messages)
+        if not parts:
+            continue
+
+        if len(parts) == 1 and parts[0].get("type") == "text":
+            content = parts[0]["text"]
+        else:
+            content = parts
+
+        # Merge a text-only user turn into the previous one unless a tool
+        # message now separates them. Some Chat Completions servers reject two
+        # consecutive user messages.
+        if (out and out[-1].get("role") == "user"
+                and not tool_messages
+                and isinstance(out[-1].get("content"), str)
+                and isinstance(content, str)):
+            out[-1]["content"] = out[-1]["content"] + "\n\n" + content
+        else:
+            out.append({"role": "user", "content": content})
+
+    return out
+
+
+def anthropic_tools(tools) -> list:
+    out = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        schema = tool.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        out.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description") or "",
+                "parameters": schema,
+            },
+        })
+    return out
+
+
+def anthropic_tool_choice(choice, tools: list):
+    """Anthropic tool_choice -> OpenAI tool_choice (None means omit)."""
+    if not tools or not isinstance(choice, dict):
+        return None
+    kind = choice.get("type")
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "tool" and choice.get("name"):
+        return {"type": "function",
+                "function": {"name": choice["name"]}}
+    return None
+
+
+def build_payload(body: dict, default_model: str, max_output: int = 0) -> dict:
+    """Translate an Anthropic Messages request into a Numes chat body."""
+    model = body.get("model")
+    if not isinstance(model, str) or "/" not in model:
+        # Claude Code names background calls after Anthropic tiers
+        # ("claude-sonnet-4-5", "sonnet", "haiku"); Numes has no such ids.
+        model = default_model
+
+    messages = anthropic_messages(body.get("system"), body.get("messages"))
+    payload: dict = {"model": model, "messages": messages}
+
+    tools = anthropic_tools(body.get("tools"))
+    if tools:
+        payload["tools"] = tools
+    choice = anthropic_tool_choice(body.get("tool_choice"), tools)
+    if choice is not None:
+        payload["tool_choice"] = choice
+
+    # Anthropic's disable_parallel_tool_use is the inverse of OpenAI's flag.
+    raw_choice = body.get("tool_choice")
+    if isinstance(raw_choice, dict) and raw_choice.get("disable_parallel_tool_use"):
+        payload["parallel_tool_calls"] = False
+
+    max_tokens = body.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        cap = max_output if max_output and max_output > 0 else MAX_OUTPUT_HARD_CAP
+        payload["max_tokens"] = min(max_tokens, cap, MAX_OUTPUT_HARD_CAP)
+
+    for name in ("temperature", "top_p", "top_k"):
+        value = body.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            payload[name] = value
+
+    stop = body.get("stop_sequences")
+    if isinstance(stop, list) and stop:
+        payload["stop"] = [s for s in stop if isinstance(s, str)]
+
+    if body.get("stream"):
+        payload["stream"] = True
+        # Numes always returns usage, but asking is harmless and makes the
+        # intent explicit for other OpenAI-compatible deployments.
+        payload["stream_options"] = {"include_usage": True}
+
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# OpenAI response -> Anthropic response
+# ---------------------------------------------------------------------------
+
+
+def usage_of(usage) -> dict:
+    usage = usage if isinstance(usage, dict) else {}
+    input_tokens = usage.get("prompt_tokens")
+    output_tokens = usage.get("completion_tokens")
+    input_tokens = int(input_tokens) if isinstance(input_tokens, int) else 0
+    output_tokens = int(output_tokens) if isinstance(output_tokens, int) else 0
+    details = usage.get("prompt_tokens_details")
+    cached = 0
+    if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+        cached = details["cached_tokens"]
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_input_tokens": cached,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def stop_reason_of(finish: str, has_tools: bool) -> str:
+    if has_tools:
+        return "tool_use"
+    if finish == "length":
+        return "max_tokens"
+    if finish in ("tool_calls", "function_call"):
+        return "tool_use"
+    return "end_turn"
+
+
+def openai_to_anthropic(data: dict, model: str) -> dict:
+    choice = (data.get("choices") or [{}])[0]
+    if not isinstance(choice, dict):
+        choice = {}
+    message = choice.get("message") or {}
+    if not isinstance(message, dict):
+        message = {}
+
+    content: list = []
+    text = message.get("content")
+    if isinstance(text, str) and text:
+        content.append({"type": "text", "text": text})
+    elif isinstance(text, list):
+        for part in text:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                content.append({"type": "text", "text": part["text"]})
+
+    calls = message.get("tool_calls") or []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        content.append({
+            "type": "tool_use",
+            "id": call.get("id") or ("toolu_" + uuid.uuid4().hex[:24]),
+            "name": name,
+            "input": _tool_input(function.get("arguments") or "{}"),
+        })
+
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    return {
+        "id": "msg_" + uuid.uuid4().hex[:24],
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason_of(choice.get("finish_reason"), bool(calls)),
+        "stop_sequence": None,
+        "usage": usage_of(data.get("usage")),
+    }
+
+
+def estimate_input_tokens(body: dict) -> int:
+    """A chars/4 estimate of a request, used only where Numes reports nothing.
+
+    Streaming responses do not carry usage until the last chunk, but Anthropic's
+    message_start carries input_tokens. An estimate is more useful than a
+    literal zero for the client's context display; the exact figure is not
+    invented for billing and is not used here for that.
+    """
+    chars = len(flatten_text(body.get("system")))
+    for message in body.get("messages") or []:
+        if isinstance(message, dict):
+            chars += len(flatten_text(message.get("content")))
+    chars += len(json.dumps(body.get("tools") or []))
+    return max(1, chars // 4)
+
+
+def sse(event: str, data: dict) -> bytes:
+    return ("event: %s\ndata: %s\n\n"
+            % (event, json.dumps(data, ensure_ascii=False))).encode()
+
+
+def message_start(msg_id: str, model: str, input_tokens: int = 0) -> bytes:
+    return sse("message_start", {
+        "type": "message_start",
+        "message": {
+            "id": msg_id, "type": "message", "role": "assistant",
+            "model": model, "content": [], "stop_reason": None,
+            "stop_sequence": None,
+            # Numes reports usage in the final chunk; this is an estimate so
+            # the client's context display is not stuck at zero. The exact
+            # output count arrives in message_delta.
+            "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+        },
+    })
+
+
+def tool_block(index: int, name: str, call_id: str, arguments: dict) -> list:
+    return [
+        sse("content_block_start", {
+            "type": "content_block_start", "index": index,
+            "content_block": {
+                "type": "tool_use", "id": call_id,
+                "name": name, "input": {},
+            },
+        }),
+        sse("content_block_delta", {
+            "type": "content_block_delta", "index": index,
+            "delta": {
+                "type": "input_json_delta",
+                "partial_json": json.dumps(arguments, ensure_ascii=False),
+            },
+        }),
+        sse("content_block_stop", {"type": "content_block_stop",
+                                   "index": index}),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# talking to Numes
+# ---------------------------------------------------------------------------
+
+
+def _request(path: str, key: str, payload: dict = None, stream: bool = False):
+    data = None
+    headers = {
+        "Authorization": "Bearer " + key,
+        "Accept": "text/event-stream" if stream else "application/json",
+        "User-Agent": "zim-claude-numes-proxy/1.0",
+    }
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(
+        path, data=data, headers=headers,
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        return urllib.request.urlopen(request, timeout=600)
+    except urllib.error.HTTPError as error:
+        try:
+            raw = error.read().decode("utf-8", "replace")
+        except OSError:
+            raw = ""
+        raise UpstreamError(
+            error.code, explain_failure(error.code, raw)) from error
+    except (urllib.error.URLError, OSError) as error:
+        raise UpstreamError(0, "could not reach Numes: %s" % error) from error
+
+
+def iter_sse(response):
+    """Yield parsed Numes SSE objects, raising on an error frame."""
+    for raw in response:
+        try:
+            line = raw.decode("utf-8", "replace").strip()
+        except AttributeError:
+            line = str(raw).strip()
+        if not line or line.startswith(":"):
+            continue
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        try:
+            obj = json.loads(data)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("error"):
+            raise UpstreamError(200, explain_failure(200, data))
+        yield obj
+
+
+# ---------------------------------------------------------------------------
+# the HTTP surface Claude Code talks to
+# ---------------------------------------------------------------------------
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "zim-claude-numes-proxy"
+
+    model = DEFAULT_MODEL
+    upstream = DEFAULT_UPSTREAM
+    max_output = 0
+
+    def log_message(self, fmt, *args):  # noqa: A003 - silence, Claude owns tty
+        pass
+
+    # ---- helpers ---------------------------------------------------------
+
+    def _json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def _error(self, status: int, message: str) -> None:
+        self._json(status, _error_envelope(_kind_for(status), message))
+
+    def _read_body(self) -> bytes:
+        length = self.headers.get("Content-Length")
+        if length:
+            try:
+                size = int(length)
+            except ValueError:
+                size = 0
+            if size < 0 or size > MAX_BODY:
+                return b""
+            return self.rfile.read(size)
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            chunks = []
+            total = 0
+            while True:
+                line = self.rfile.readline(128).strip()
+                try:
+                    size = int(line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline(128)
+                    break
+                total += size
+                if total > MAX_BODY:
+                    break
+                chunks.append(self.rfile.read(size))
+                self.rfile.read(2)
+            return b"".join(chunks)
+        return b""
+
+    def _key(self) -> str:
+        auth = self.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
+            if token:
+                return token
+        token = (self.headers.get("x-api-key") or "").strip()
+        return token or (os.environ.get("NUMES_API_KEY") or "").strip()
+
+    def _body_json(self) -> dict:
+        raw = self._read_body()
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    # ---- routes ----------------------------------------------------------
+
+    def do_GET(self):  # noqa: N802 - fixed by BaseHTTPRequestHandler
+        path = self.path.split("?")[0].rstrip("/") or "/"
+        if path in ("/", "/health"):
+            self._json(200, {"ok": True, "model": self.model,
+                             "upstream": self.upstream})
+            return
+        if path in ("/v1/models", "/models"):
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            key = self._key()
+            if not key:
+                self._error(401, "no Numes API key on the request")
+                return
+            url = self.upstream + "/models"
+            if query:
+                url += "?" + query
+            try:
+                response = _request(url, key)
+                raw = response.read()
+                response.close()
+            except UpstreamError as error:
+                self._error(error.status or 502, error.message)
+                return
+            try:
+                payload = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                self._error(502, "Numes returned a non-JSON model list")
+                return
+            self._json(200, payload if isinstance(payload, dict) else
+                       {"data": payload})
+            return
+        self._error(404, "no route at %s" % self.path)
+
+    def do_POST(self):  # noqa: N802
+        path = self.path.split("?")[0].rstrip("/")
+        if path.endswith("/count_tokens"):
+            body = self._body_json()
+            self._json(200, {"input_tokens": estimate_input_tokens(body)})
+            return
+        if not path.endswith("/messages"):
+            self._error(404, "no route at %s" % self.path)
+            return
+        self._messages()
+
+    # ---- the Messages route ---------------------------------------------
+
+    def _messages(self) -> None:
+        body = self._body_json()
+        if not body:
+            self._error(400, "empty or invalid JSON request body")
+            return
+        key = self._key()
+        if not key:
+            self._error(401, "no Numes API key on the request")
+            return
+
+        payload = build_payload(body, self.model, self.max_output)
+        model = payload.get("model") or self.model
+        stream = bool(body.get("stream"))
+
+        try:
+            response = _request(self.upstream + "/chat/completions", key,
+                                payload, stream=stream)
+        except UpstreamError as error:
+            self._error(error.status or 502, error.message)
+            return
+
+        if not stream:
+            try:
+                raw = response.read()
+            except OSError as error:
+                self._error(502, "reading Numes response failed: %s" % error)
+                return
+            finally:
+                try:
+                    response.close()
+                except OSError:
+                    pass
+            try:
+                data = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                self._error(502, "Numes returned a non-JSON response")
+                return
+            if isinstance(data, dict) and data.get("error"):
+                self._error(502, explain_failure(200, raw.decode(
+                    "utf-8", "replace")))
+                return
+            if not isinstance(data, dict):
+                self._error(502, "Numes returned an unexpected response")
+                return
+            self._json(200, openai_to_anthropic(data, model))
+            return
+
+        self._stream(response, model, body)
+
+    def _stream(self, response, model: str, request_body: dict = None) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        def write(chunk: bytes) -> None:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+
+        msg_id = "msg_" + uuid.uuid4().hex[:24]
+        text_open = False
+        calls: dict = {}
+        finish = ""
+        usage = None
+
+        try:
+            write(message_start(msg_id, model,
+                                estimate_input_tokens(request_body or {})))
+            for chunk in iter_sse(response):
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                choices = chunk.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                choice = choices[0]
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    delta = {}
+
+                text = delta.get("content")
+                if isinstance(text, str) and text:
+                    if not text_open:
+                        write(sse("content_block_start", {
+                            "type": "content_block_start", "index": 0,
+                            "content_block": {"type": "text", "text": ""},
+                        }))
+                        text_open = True
+                    write(sse("content_block_delta", {
+                        "type": "content_block_delta", "index": 0,
+                        "delta": {"type": "text_delta", "text": text},
+                    }))
+
+                for call in delta.get("tool_calls") or []:
+                    if not isinstance(call, dict):
+                        continue
+                    index = call.get("index")
+                    if not isinstance(index, int):
+                        index = 0
+                    entry = calls.setdefault(
+                        index, {"id": "", "name": "", "arguments": ""})
+                    call_id = call.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        entry["id"] = call_id
+                    function = call.get("function") or {}
+                    if isinstance(function, dict):
+                        name = function.get("name")
+                        if isinstance(name, str) and name:
+                            entry["name"] += name
+                        arguments = function.get("arguments")
+                        if isinstance(arguments, str) and arguments:
+                            entry["arguments"] += arguments
+
+                if choice.get("finish_reason"):
+                    finish = str(choice["finish_reason"])
+
+            next_index = 0
+            if text_open:
+                write(sse("content_block_stop", {
+                    "type": "content_block_stop", "index": 0}))
+                next_index = 1
+            elif not calls:
+                # Anthropic requires at least one content block. A blank text
+                # block is the honest representation of an empty reply.
+                write(sse("content_block_start", {
+                    "type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }))
+                write(sse("content_block_stop", {
+                    "type": "content_block_stop", "index": 0}))
+                next_index = 1
+
+            emitted = 0
+            for index in sorted(calls):
+                entry = calls[index]
+                name = entry.get("name")
+                if not name:
+                    continue
+                call_id = entry.get("id") or ("toolu_" + uuid.uuid4().hex[:24])
+                args = _tool_input(entry.get("arguments") or "{}")
+                for chunk in tool_block(next_index + emitted, name, call_id, args):
+                    write(chunk)
+                emitted += 1
+
+            stop = stop_reason_of(finish, bool(emitted))
+            usage_obj = usage_of(usage)
+            write(sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {"output_tokens": usage_obj["output_tokens"]},
+            }))
+            write(sse("message_stop", {"type": "message_stop"}))
+        except UpstreamError as error:
+            try:
+                write(sse("error", _error_envelope(
+                    _kind_for(error.status), error.message)))
+            except OSError:
+                pass
+        except (BrokenPipeError, ConnectionResetError):
+            # Claude Code hung up (Ctrl-C, or it stopped reading).
+            pass
+        finally:
+            try:
+                response.close()
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def _watch_parent(pid: int) -> None:
+    """Exit when the wrapper that started us disappears (POSIX only).
+
+    The wrapper also kills the proxy on exit, but a SIGKILLed wrapper would
+    otherwise leave a listener behind. Windows uses the wrapper's finally block.
+    """
+    if os.name != "posix":
+        return
+    while True:
+        time.sleep(2)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            os._exit(0)
+        except PermissionError:
+            pass
+
+
+def main(argv: list = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="zim-claude-numes-proxy",
+        description="Translate Anthropic Messages to Numes chat completions.")
+    parser.add_argument("--port", type=int, default=0,
+                        help="port to bind (0 picks a free one)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="address to bind (default 127.0.0.1)")
+    parser.add_argument("--model", default=DEFAULT_MODEL,
+                        help="model to use for Anthropic tier names")
+    parser.add_argument("--upstream", default=DEFAULT_UPSTREAM,
+                        help="Numes API root")
+    parser.add_argument("--max-output", type=int, default=0,
+                        help="cap max_tokens at this model ceiling")
+    parser.add_argument("--port-file", default="",
+                        help="write the bound port here for the wrapper")
+    parser.add_argument("--parent-pid", type=int, default=0,
+                        help="exit when this process disappears")
+    args = parser.parse_args(argv)
+
+    Handler.model = args.model
+    Handler.upstream = args.upstream.rstrip("/")
+    Handler.max_output = max(0, args.max_output)
+
+    ThreadingHTTPServer.allow_reuse_address = True
+    ThreadingHTTPServer.daemon_threads = True
+    ThreadingHTTPServer.request_queue_size = 32
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    port = server.server_address[1]
+
+    if args.port_file:
+        temporary = args.port_file + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as handle:
+            handle.write(str(port))
+        try:
+            os.chmod(temporary, 0o600)
+        except OSError:
+            pass
+        os.replace(temporary, args.port_file)
+
+    # The wrapper reads --port-file; the line is for a human running this by
+    # hand. Nothing else ever writes to stdout.
+    print("PORT=%d" % port, flush=True)
+
+    if args.parent_pid > 0:
+        threading.Thread(target=_watch_parent, args=(args.parent_pid,),
+                         daemon=True).start()
+
+    def terminate(signum, frame):
+        raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, terminate)
+        # Ctrl-C in the terminal would otherwise kill the translation layer
+        # while Claude Code is still cleaning up. The wrapper stops us.
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (ValueError, OSError):
+        pass
+
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

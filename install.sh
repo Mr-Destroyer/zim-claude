@@ -314,7 +314,7 @@ install_config_yaml() {
 # scripted install. Nothing is read from this checkout any more: Token Juice's
 # unlimited quota ended, so config/token is deliberately not loaded (the file
 # stays — it is public by design), and a missing key is NOT an error. The
-# wrapper routes to Coarena and asks for its own key on first run.
+# wrapper routes to Numes and asks for its own key on first run.
 #
 # One thing is repaired, with a backup: a profile aimed at the local proxy whose
 # base URL names a port that rejects its own token. That is a real machine —
@@ -384,7 +384,7 @@ install_config_env() {
 
   if [[ -z "$token" ]]; then
     # No credential anywhere. Not an error any more: the proxy is optional and
-    # zim-claude asks for its own Coarena key on first run. Anyone who wants the
+    # zim-claude asks for its own Numes key on first run. Anyone who wants the
     # proxy route can export ZIM_CLAUDE_TOKEN=tj_… and re-run. Returning 0 matters —
     # the background auto-updater installs with stdin closed, so a failure here
     # would abort every upgrade on a machine without a profile.
@@ -393,7 +393,7 @@ install_config_env() {
       return 0
     fi
     say "no Token Juice key in $ENV_FILE or ZIM_CLAUDE_TOKEN — skipping the profile"
-    say "  (the proxy profile is optional; zim-claude itself routes to Coarena)"
+    say "  (the proxy profile is optional; zim-claude itself routes to Numes)"
     return 0
   fi
 
@@ -694,6 +694,25 @@ check_prereqs() {
     command -v "$t" >/dev/null 2>&1 || { err "required tool missing: $t"; PREREQ_FAILED=1; }
   done
 
+  # python3 is load-bearing for the Numes route, not just for the optional
+  # LiteLLM proxy: Claude Code speaks Anthropic Messages and Numes speaks OpenAI
+  # Chat Completions, so the per-session translation proxy is Python.
+  if ! command -v python3 >/dev/null 2>&1; then
+    err "python3 is required for the Numes translation proxy, and it is not on PATH."
+    case "$(pkg_manager)" in
+      apt)    warn "    sudo apt install python3" ;;
+      pacman) warn "    sudo pacman -S python" ;;
+      dnf)    warn "    sudo dnf install python3" ;;
+      *)      warn "    install Python 3.8+ from https://python.org" ;;
+    esac
+    PREREQ_FAILED=1
+  elif ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' 2>/dev/null; then
+    err "python3 is too old for the Numes translation proxy (need 3.8+): $(python3 --version 2>&1)"
+    PREREQ_FAILED=1
+  else
+    say "found python3: $(command -v python3)"
+  fi
+
   if command -v claude >/dev/null 2>&1; then
     say "found claude: $(command -v claude)"
   else
@@ -731,10 +750,10 @@ check_prereqs() {
   elif [[ -x "$HOME/.local/bin/litellm" ]]; then
     say "found litellm: $HOME/.local/bin/litellm — reusing it"
   else
-    # The proxy is OPTIONAL now: zim-claude routes to Coarena directly, so a
-    # missing litellm must not fail the install. The
-    # background updater runs exactly this path, and an exit 1 there would log
-    # a failed upgrade on every machine without a proxy.
+    # The LiteLLM proxy is OPTIONAL now: zim-claude routes to Numes through its
+    # own per-session proxy, so a missing litellm must not fail the install.
+    # The background updater runs exactly this path, and an exit 1 there would
+    # log a failed upgrade on every machine without a proxy.
     # `|| ...` is load-bearing: this script runs under `set -e`, so a bare call
     # would abort the whole install the moment the venv step declines or fails.
     if ! ensure_proxy_venv; then
@@ -931,6 +950,8 @@ check_prereqs
 
 say "installing files"
 install_file "$SRC_DIR/scripts/zim-claude"       "$BIN_DIR/zim-claude"       755
+install_file "$SRC_DIR/scripts/zim-claude-numes-proxy" \
+             "$BIN_DIR/zim-claude-numes-proxy" 755
 install_file "$SRC_DIR/scripts/start-litellm.sh" "$BIN_DIR/start-litellm.sh" 755
 install_file "$SRC_DIR/scripts/zim-claude-update.sh" "$BIN_DIR/zim-claude-update.sh" 755
 install_config_yaml
@@ -953,10 +974,12 @@ say "model configuration: $CONFIG_FILE"
 say "credential profile:  $ENV_FILE"
 
 printf '\n'
-say "zim-claude routes to Coarena (https://coarena.ai)."
-say "  Run zim-claude and it will ask for a Coarena API key once, then save it"
-say "  to $STATE_DIR/coarena.key (mode 600). Create one at"
-say "  https://coarena.ai/account/api."
+say "zim-claude routes to Numes (https://api.numes.ai)."
+say "  Run zim-claude and it will ask for a Numes API key once, then save it"
+say "  to $STATE_DIR/numes.key (mode 600). Create one at"
+say "  https://numes.ai/dashboard/keys."
+say "  A local proxy translates Anthropic Messages to Numes' OpenAI-compatible"
+say "  API. It starts per session, listens on loopback only, and needs python3."
 say "  The LiteLLM proxy above is optional and unrelated: it stays installed for"
 say "  other harnesses on this machine."
 
